@@ -8,7 +8,7 @@ GFRR 模型包
 """
 from .encoder_gfrr import GFRREncoder, DualChannelInput, PIRALayer
 from .gfrr import GFRRLite, ClassificationHead
-from .neural_si_propagator import NeuralSIPropagator, AsymmetricInfectionRatePredictor
+from .neural_si_propagator import NeuralSIPropagator, DynamicInfectionRatePredictor
 
 __all__ = [
     'GFRREncoder',
@@ -17,5 +17,5 @@ __all__ = [
     'GFRRLite',
     'ClassificationHead',
     'NeuralSIPropagator',
-    'AsymmetricInfectionRatePredictor'
+    'DynamicInfectionRatePredictor'
 ]
