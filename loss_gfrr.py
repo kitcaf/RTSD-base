@@ -197,6 +197,12 @@ class GFRRLoss(nn.Module):
         
         source_indices = torch.where(source_mask)[0]
         
+        # 处理 max_cc_id（可能是标量或列表）
+        if isinstance(max_cc_id, (list, tuple)):
+            max_cc_id = max_cc_id[0]
+        if isinstance(max_cc_id, torch.Tensor):
+            max_cc_id = max_cc_id.item()
+        
         # 获取最大CC的embedding
         if max_cc_id not in z_cc_dict:
             return torch.tensor(0.0, device=device)

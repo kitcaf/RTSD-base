@@ -73,7 +73,7 @@ class GFRRLite(nn.Module):
         cc_labels = data.cc_labels if hasattr(data, 'cc_labels') else None
         train_mask = data.train_mask if hasattr(data, 'train_mask') else None
         
-        z, z_cc_dict, _ = self.encoder(
+        z, z_cc_dict, gate_weights = self.encoder(
             data.x, data.edge_index, 
             k_inf=k_inf, edge_dist=edge_dist, degrees=degrees,
             cc_labels=cc_labels, train_mask=train_mask

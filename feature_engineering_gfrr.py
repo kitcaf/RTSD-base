@@ -53,16 +53,18 @@ class FeatureEngineerGFRR:
         'subgraph_closeness', 'subgraph_eccentricity', 'outward_ratio'
     ]
     
-    def __init__(self, adj_matrix):
+    def __init__(self, adj_matrix, ablation_feature_idx=None):
         """
         初始化特征工程器
         
         Args:
             adj_matrix: 邻接矩阵 [N, N]
+            ablation_feature_idx: 要消融的特征索引 (0-13), None表示不消融
         """
         self.adj_matrix = adj_matrix
         self.G = nx.from_numpy_array(adj_matrix)
         self.num_nodes = adj_matrix.shape[0]
+        self.ablation_feature_idx = ablation_feature_idx
         
         # 预计算全图静态特征
         self.degrees = np.array([d for n, d in self.G.degree()])
@@ -140,6 +142,27 @@ class FeatureEngineerGFRR:
                 pass
         
         return closeness, eccentricity, max(max_ecc, 1.0)
+    
+    def _apply_ablation(self, features):
+        """
+        应用特征消融：移除指定特征列
+        
+        Args:
+            features: [N, 14] 特征矩阵
+        
+        Returns:
+            ablated_features: [N, 13] 消融后的特征矩阵
+        """
+        if self.ablation_feature_idx is None:
+            return features
+        
+        # 删除指定列
+        ablated = np.delete(features, self.ablation_feature_idx, axis=1)
+        return ablated
+    
+    def get_num_features(self):
+        """返回当前特征维度"""
+        return 13 if self.ablation_feature_idx is not None else 14
     
     def _extract_cc_info(self, infected_indices):
         """
@@ -269,6 +292,10 @@ class FeatureEngineerGFRR:
                 sg_closeness, sg_eccentricity, outward_ratio
             ]
         
+        # 应用特征消融
+        if self.ablation_feature_idx is not None:
+            x_observed = self._apply_ablation(x_observed)
+        
         return x_observed, torch.FloatTensor(k_inf_all), cc_labels, max_cc_id
     
     def _build_source_features(self, source_indices):
@@ -342,6 +369,10 @@ class FeatureEngineerGFRR:
                 kinf_rank_nb, is_peak, norm_bridge,
                 sg_closeness, sg_eccentricity, outward_ratio
             ]
+        
+        # 应用特征消融
+        if self.ablation_feature_idx is not None:
+            x_source = self._apply_ablation(x_source)
         
         return x_source
     
