@@ -1,0 +1,408 @@
+"""
+GFRR Encoder 模块
+基于 GAT 的共享编码器，将观测态/源点态特征映射到潜在空间
+
+设计原则:
+    1. 双通道输入: StateEmbedding + TopoProjection
+    2. SE-Block 特征重校准
+    3. GAT 残差块提取图结构特征
+    4. GatedFusion 多尺度融合
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn import Parameter
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import softmax, add_self_loops, remove_self_loops
+
+
+# ==========================================
+# 1. PIRA Layer (传播逆向推理注意力层)
+# ==========================================
+class PIRALayer(MessagePassing):
+    """
+    Propagation Inverse Reasoning Attention (PIRA) Layer
+    
+    核心创新: 在 GATv2 注意力中注入 "感染密度梯度" 偏置
+    
+    公式:
+        α_ij = softmax(LeakyReLU(a^T [W_l·h_i + W_r·h_j]) + β · Δk(i,j))
+        Δk(i,j) = k_inf_norm(j) - k_inf_norm(i)  (感染密度梯度)
+    
+    直觉:
+        - 源点: 四周邻居感染密度相近 → 梯度小 → 均匀接收
+        - 边缘节点: 一侧密度高一侧低 → 梯度大 → 偏向高密度侧
+        - 效果: 信息沿感染密度梯度方向 (边缘→源头) 逐层聚合
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        heads: int = 4,
+        concat: bool = True,
+        negative_slope: float = 0.2,
+        dropout: float = 0.1,
+        add_self_loops: bool = True,
+        bias: bool = True,
+        beta: float = 1.0,
+        lambda_1: float = 0.5,
+        lambda_2: float = 1.0,
+        **kwargs
+    ):
+        kwargs.setdefault('aggr', 'add')
+        super().__init__(node_dim=0, **kwargs)
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.heads = heads
+        self.concat = concat
+        self.negative_slope = negative_slope
+        self.dropout = dropout
+        self._add_self_loops = add_self_loops
+        self.beta = beta
+        self.lambda_1 = lambda_1
+        self.lambda_2 = lambda_2
+        
+        # 线性变换
+        self.lin_l = nn.Linear(in_channels, heads * out_channels, bias=False)
+        self.lin_r = nn.Linear(in_channels, heads * out_channels, bias=False)
+        
+        # 注意力参数
+        self.att = Parameter(torch.Tensor(1, heads, out_channels))
+        
+        # PIRA: 可学习的感染梯度偏置 (per-head)
+        self.gradient_bias = Parameter(torch.ones(heads) * 0.1)
+        
+        # 偏置
+        if bias and concat:
+            self.bias = Parameter(torch.Tensor(heads * out_channels))
+        elif bias:
+            self.bias = Parameter(torch.Tensor(out_channels))
+        else:
+            self.register_parameter('bias', None)
+        
+        self._reset_parameters()
+    
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.lin_l.weight)
+        nn.init.xavier_uniform_(self.lin_r.weight)
+        nn.init.xavier_uniform_(self.att)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+    
+    def forward(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None):
+        """
+        Args:
+            x: 节点特征 [N, C]
+            edge_index: 边索引 [2, E]
+            k_inf: 感染邻居数 [N] (PIRA 梯度信号, 可选)
+            edge_dist: 边距离 [E] (可选)
+            degrees: 节点度数 [N] (可选)
+        """
+        N = x.size(0)
+        
+        if self._add_self_loops:
+            if edge_dist is not None:
+                # 同步扩展 edge_dist，自环距离填 1.0（log(1.0)=0，无惩罚）
+                edge_index, edge_dist = remove_self_loops(edge_index, edge_dist)
+                edge_index, edge_dist = add_self_loops(
+                    edge_index, edge_dist, fill_value=1.0, num_nodes=N
+                )
+            else:
+                edge_index, _ = remove_self_loops(edge_index)
+                edge_index, _ = add_self_loops(edge_index, num_nodes=N)
+        
+        # 归一化 k_inf 到 [0, 1]
+        if k_inf is not None:
+            k_inf_max = k_inf.max().clamp(min=1.0)
+            k_inf_norm = k_inf / k_inf_max  # [N]
+        else:
+            k_inf_norm = torch.zeros(N, device=x.device)
+        
+        x_l = self.lin_l(x).view(-1, self.heads, self.out_channels)
+        x_r = self.lin_r(x).view(-1, self.heads, self.out_channels)
+        
+        out = self.propagate(edge_index, x=(x_l, x_r), k_inf_norm=k_inf_norm, edge_dist=edge_dist, degrees=degrees, size=None)
+        
+        if self.concat:
+            out = out.view(-1, self.heads * self.out_channels)
+        else:
+            out = out.mean(dim=1)
+        
+        if self.bias is not None:
+            out = out + self.bias
+        
+        return out
+    
+    def message(self, x_i, x_j, k_inf_norm_i, k_inf_norm_j, edge_dist, degrees_j, index, ptr, size_i):
+        # GATv2 注意力
+        x_sum = x_i + x_j
+        x_sum = F.leaky_relu(x_sum, negative_slope=self.negative_slope)
+        alpha = (x_sum * self.att).sum(dim=-1)  # [E, heads]
+        
+        # PIRA: 感染密度梯度偏置
+        # Δk = k_inf(j) - k_inf(i): 当邻居j感染密度 > 自身i时, 注意力增强
+        # 效果: 低密度节点更关注高密度邻居 → 信息从边缘回溯到源头
+        delta_kinf = (k_inf_norm_j - k_inf_norm_i)  # [E]
+        alpha = alpha + self.gradient_bias * self.beta * delta_kinf.unsqueeze(-1)  # [E, heads]
+        
+        # Topology-aware Attention (距离衰减与大V防虹吸度数阻尼)
+        if edge_dist is not None:
+            dist_penalty = self.lambda_1 * torch.log(edge_dist.clamp(min=1.0))
+            alpha = alpha - dist_penalty.unsqueeze(-1)
+            
+        if degrees_j is not None:
+            deg_penalty = self.lambda_2 * torch.log(degrees_j + 1.0)
+            alpha = alpha - deg_penalty.unsqueeze(-1)
+        
+        alpha = softmax(alpha, index, ptr, size_i)
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        return alpha.unsqueeze(-1) * x_j
+
+
+# ==========================================
+# 2. 双通道输入层
+# ==========================================
+class DualChannelInput(nn.Module):
+    """
+    双通道输入层: 状态嵌入 + 拓扑投影
+    
+    设计原则:
+        - StateEmbedding: 将 0/1 状态映射为语义向量
+        - TopoProjection: 将 13 维拓扑特征投影到隐藏空间
+        - SE-Block: 自适应特征重校准
+    
+    Args:
+        state_dim: 状态嵌入维度 (默认 8)
+        topo_dim: 拓扑投影维度 (默认 24)
+        num_topo_features: 拓扑特征数量 (默认 13)
+    """
+    def __init__(self, state_dim=8, topo_dim=24, num_topo_features=13):
+        super().__init__()
+        
+        self.state_dim = state_dim
+        self.topo_dim = topo_dim
+        self.out_dim = state_dim + topo_dim
+        
+        # 状态嵌入: 0 -> "未感染/非源点", 1 -> "感染/源点"
+        self.state_embedding = nn.Embedding(2, state_dim)
+        
+        # 拓扑投影
+        self.topo_projection = nn.Sequential(
+            nn.Linear(num_topo_features, topo_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(topo_dim, topo_dim)
+        )
+        
+        # SE-Block 特征重校准
+        self.se_block = nn.Sequential(
+            nn.Linear(self.out_dim, self.out_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.out_dim // 2, self.out_dim),
+            nn.Sigmoid()
+        )
+        
+        self._reset_parameters()
+    
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.state_embedding.weight)
+        for layer in self.topo_projection:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: [N, 14] 特征矩阵, 第0列是状态标志
+        
+        Returns:
+            h_fused: [N, state_dim + topo_dim] 融合特征
+        """
+        # 分离状态和拓扑特征
+        state_col = x[:, 0].long().clamp(0, 1)  # [N]
+        topo_cols = x[:, 1:]  # [N, 13]
+        
+        # 双通道映射
+        h_state = self.state_embedding(state_col)  # [N, state_dim]
+        h_topo = self.topo_projection(topo_cols)   # [N, topo_dim]
+        
+        # 拼接
+        h_cat = torch.cat([h_state, h_topo], dim=-1)  # [N, out_dim]
+        
+        # SE 重校准
+        weights = self.se_block(h_cat)
+        h_fused = h_cat * weights
+        
+        return h_fused
+
+
+# ==========================================
+# 3. PIRA 残差块
+# ==========================================
+class PIRAResidualBlock(nn.Module):
+    """
+    PIRA 残差块
+    
+    架构: PIRALayer -> LeakyReLU -> Dropout + Skip Connection
+    """
+    def __init__(self, channels, heads=4, dropout=0.3, beta=1.0, lambda_1=0.5, lambda_2=1.0):
+        super().__init__()
+        
+        out_per_head = channels // heads
+        self.pira = PIRALayer(
+            in_channels=channels,
+            out_channels=out_per_head,
+            heads=heads,
+            concat=True,
+            dropout=0.1,
+            beta=beta,
+            lambda_1=lambda_1,
+            lambda_2=lambda_2
+        )
+        self.activation = nn.LeakyReLU(0.2)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None):
+        residual = self.pira(x, edge_index, k_inf=k_inf, edge_dist=edge_dist, degrees=degrees)
+        residual = self.activation(residual)
+        out = x + residual
+        out = self.dropout(out)
+        return out
+
+
+# ==========================================
+# 4. 门控融合模块
+# ==========================================
+class GatedFusion(nn.Module):
+    """
+    自适应门控融合: 融合多层 GAT 输出
+    """
+    def __init__(self, in_channels):
+        super().__init__()
+        
+        self.gate_net = nn.Sequential(
+            nn.Linear(in_channels * 2, in_channels // 2),
+            nn.ReLU(),
+            nn.Linear(in_channels // 2, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, h1, h2):
+        """
+        Args:
+            h1: 浅层特征 [N, C]
+            h2: 深层特征 [N, C]
+        
+        Returns:
+            h_out: 融合特征 [N, C]
+            gate: 门控权重 [N, 1]
+        """
+        cat_feat = torch.cat([h1, h2], dim=-1)
+        gate = self.gate_net(cat_feat)
+        h_out = gate * h1 + (1 - gate) * h2
+        return h_out, gate
+
+
+# ==========================================
+# 5. GFRR Encoder 主模型
+# ==========================================
+class GFRREncoder(nn.Module):
+    """
+    GFRR 编码器: 将 14 维输入特征映射到潜在空间
+    
+    架构:
+        Input [N, 14]
+            ↓
+        DualChannelInput (State + Topo)
+            ↓
+        GAT Residual Blocks × num_blocks
+            ↓
+        GatedFusion (多尺度融合)
+            ↓
+        z [N, hidden_dim] (潜在表示)
+    
+    Args:
+        num_features: 输入特征维度 (默认 14)
+        hidden_dim: 隐藏层维度 (默认 32)
+        num_blocks: GAT 残差块数量 (默认 3)
+        dropout: Dropout 比例 (默认 0.3)
+        beta: 感染梯度引导系数
+        lambda_1: 物理距离衰减系数
+        lambda_2: 大V防虹吸惩罚系数
+    """
+    def __init__(
+        self,
+        num_features: int = 14,
+        hidden_dim: int = 32,
+        num_blocks: int = 3,
+        dropout: float = 0.3,
+        beta: float = 1.0,
+        lambda_1: float = 0.5,
+        lambda_2: float = 1.0
+    ):
+        super().__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.num_blocks = num_blocks
+        
+        # 动态计算双通道维度 (总和为 hidden_dim)
+        state_dim = max(4, hidden_dim // 4)
+        topo_dim = hidden_dim - state_dim
+        
+        # 双通道输入
+        self.input_layer = DualChannelInput(
+            state_dim=state_dim,
+            topo_dim=topo_dim,
+            num_topo_features=num_features - 1  # 除去状态列
+        )
+        
+        # PIRA 残差块
+        self.res_blocks = nn.ModuleList([
+            PIRAResidualBlock(
+                hidden_dim, 
+                heads=4, 
+                dropout=dropout, 
+                beta=beta, 
+                lambda_1=lambda_1, 
+                lambda_2=lambda_2
+            )
+            for _ in range(num_blocks)
+        ])
+        
+        # 门控融合
+        self.gated_fusion = GatedFusion(hidden_dim)
+    
+    def forward(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None):
+        """
+        前向传播
+        
+        Args:
+            x: 节点特征 [N, 14]
+            edge_index: 边索引 [2, E]
+            k_inf: 感染邻居数 [N] (PIRA 梯度信号, 可选)
+            edge_dist: 边距离 [E] (可选)
+            degrees: 节点度数 [N] (可选)
+            
+        Returns:
+            z: 潜在表示 [N, hidden_dim]
+            gate_weights: 门控权重 [N, 1] (可选, 用于分析)
+        """
+        # 双通道输入
+        h = self.input_layer(x)  # [N, 32]
+        
+        # PIRA 残差块 (传入 k_inf 作为感染密度梯度信号, edge_dist/degrees作为约束)
+        layer_outputs = []
+        for block in self.res_blocks:
+            h = block(h, edge_index, k_inf=k_inf, edge_dist=edge_dist, degrees=degrees)
+            layer_outputs.append(h)
+        
+        # 门控融合 (融合第一层和最后一层)
+        z, gate_weights = self.gated_fusion(layer_outputs[0], layer_outputs[-1])
+        
+        return z, gate_weights
+    
+    def encode(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None):
+        """简化接口: 仅返回潜在表示"""
+        z, _ = self.forward(x, edge_index, k_inf=k_inf, edge_dist=edge_dist, degrees=degrees)
+        return z
