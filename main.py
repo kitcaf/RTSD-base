@@ -17,7 +17,9 @@ from config import (
     TRAIN_RATIO, VAL_RATIO, RECALL_K_VALUES,
     LR, WEIGHT_DECAY, EPOCHS,
     USE_DYNAMIC_POS_WEIGHT, DEFAULT_POS_WEIGHT,
-    get_gfrr_arch_config, get_gfrr_loss_config
+    USE_FORWARD_GENERATOR, FORWARD_WARMUP_EPOCHS,
+    get_gfrr_arch_config, get_gfrr_loss_config,
+    get_forward_generator_config, get_forward_loss_config
 )
 from data_loader import load_raw_data
 from feature_engineering_gfrr import FeatureEngineerGFRR
@@ -34,33 +36,51 @@ from utils import (
 from metrics_utils import precompute_shortest_paths
 
 
-def train_epoch(model, loader, criterion, optimizer, device):
+def train_epoch(model, loader, criterion, optimizer, device, use_forward=False, epoch=0, warmup_epochs=20):
     """
-    训练一个 epoch 
+    训练一个 epoch
+    
+    Args:
+        use_forward: 是否使用前向生成器
+        epoch: 当前轮数 (用于分阶段训练)
+        warmup_epochs: 预热轮数 (前 N 轮只训练后向)
     """
     model.train()
     
     total_loss = 0
-    loss_components = {'cls': 0, 'bce': 0, 'rank': 0}
+    loss_components = {'bce': 0, 'rank': 0, 'forward': 0, 'focal': 0, 'dice': 0}
     num_batches = 0
+    
+    # 判断是否启用前向生成 (分阶段训练)
+    enable_forward = use_forward and (epoch >= warmup_epochs)
     
     for data in loader:
         data = data.to(device)
         optimizer.zero_grad()
         
-        logits = model(data)
+        # 前向传播
+        if enable_forward:
+            logits, O_pred = model(data, return_propagation=True)
+        else:
+            logits = model(data, return_propagation=False)
+            O_pred = None
         
         mask = data.train_mask
         if mask.sum() > 0:
+            # 计算损失
             loss_dict = criterion(
-                logits, data.y, mask,
-                k_inf=data.k_inf if hasattr(data, 'k_inf') else None
+                logits=logits,
+                target=data.y,
+                mask=mask,
+                k_inf=data.k_inf if hasattr(data, 'k_inf') else None,
+                O_pred=O_pred,
+                O_true_mask=data.train_mask if enable_forward else None
             )
             
             loss = loss_dict['total']
             loss.backward()
             
-            # 梯度裁剪 (与完整版一致)
+            # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
@@ -101,6 +121,15 @@ def main():
     # 获取配置 (提前读取以获取 k_hop)
     arch_config = get_gfrr_arch_config()
     loss_config = get_gfrr_loss_config()
+    
+    # 前向生成器配置 (可选)
+    use_forward = USE_FORWARD_GENERATOR
+    if use_forward:
+        forward_gen_config = get_forward_generator_config()
+        forward_loss_config = get_forward_loss_config()
+    else:
+        forward_gen_config = {}
+        forward_loss_config = {}
     
     # 特征工程 (与完整版完全一致)
     engineer = FeatureEngineerGFRR(adj)
@@ -154,7 +183,11 @@ def main():
         dropout=arch_config.get('dropout', 0.3),
         beta=arch_config.get('beta', 1.0),
         lambda_1=arch_config.get('lambda_1', 0.5),
-        lambda_2=arch_config.get('lambda_2', 1.0)
+        lambda_2=arch_config.get('lambda_2', 1.0),
+        use_forward_generator=use_forward,
+        propagation_steps=forward_gen_config.get('k_steps', 3) if use_forward else 3,
+        beta_init=forward_gen_config.get('beta_init', 1.0) if use_forward else 1.0,
+        infection_rate_hidden=forward_gen_config.get('infection_rate_hidden', 16) if use_forward else 16
     ).to(DEVICE)
     
     # 打印模型参数
@@ -162,12 +195,20 @@ def main():
     log_print(logger, f"[*] 模型参数:")
     log_print(logger, f"    Encoder: {param_info['encoder']:,}")
     log_print(logger, f"    ClassHead: {param_info['class_head']:,}")
+    if 'propagator' in param_info:
+        log_print(logger, f"    Propagator: {param_info['propagator']:,}")
     log_print(logger, f"    Total: {param_info['total']:,}")
     
     criterion = GFRRLoss(
         pos_weight=pos_weight,
         lambda_rank=loss_config.get('lambda_rank', 0.1),
-        margin=loss_config.get('margin', 0.15)
+        margin=loss_config.get('margin', 0.15),
+        use_forward_loss=use_forward,
+        lambda_forward=forward_loss_config.get('lambda_forward', 0.5) if use_forward else 0.0,
+        lambda_focal=forward_loss_config.get('lambda_focal', 1.0) if use_forward else 1.0,
+        lambda_dice=forward_loss_config.get('lambda_dice', 0.5) if use_forward else 0.5,
+        focal_alpha=forward_loss_config.get('focal_alpha', 0.25) if use_forward else 0.25,
+        focal_gamma=forward_loss_config.get('focal_gamma', 2.0) if use_forward else 2.0
     ).to(DEVICE)
     
     # 优化器 (与完整版完全一致)
@@ -191,17 +232,32 @@ def main():
     log_print(logger, f"      K-hop 图: {arch_config.get('k_hop', 2)}")
     log_print(logger, f"      PIRA 参数: beta={arch_config.get('beta', 1.0)}, L1={arch_config.get('lambda_1', 0.5)}, L2={arch_config.get('lambda_2', 1.0)}")
     log_print(logger, f"      数据划分: cascade_id 分组 (Train=全快照, Val/Test=仅最终快照)")
+    if use_forward:
+        log_print(logger, f"      前向生成器: 启用")
+        log_print(logger, f"        传播步数: {forward_gen_config.get('k_steps', 3)}")
+        log_print(logger, f"        初始感染烈度: {forward_gen_config.get('beta_init', 1.0)}")
+        log_print(logger, f"        预热轮数: {FORWARD_WARMUP_EPOCHS}")
+        log_print(logger, f"        Lambda Forward: {forward_loss_config.get('lambda_forward', 0.5)}")
+        log_print(logger, f"        Focal (α={forward_loss_config.get('focal_alpha', 0.25)}, γ={forward_loss_config.get('focal_gamma', 2.0)})")
+    else:
+        log_print(logger, f"      前向生成器: 禁用 (仅后向判别)")
     log_print(logger, f"{'='*60}\n")
     
     # 训练循环
     best_val_f1 = 0
     best_threshold = 0.5
     best_epoch = 0
-    save_path = f'checkpoints_gfrr/gfrr_lite_{data_name}_ablation_noflow_best.pt'
+    suffix = '_with_forward' if use_forward else '_ablation_noflow'
+    save_path = f'checkpoints_gfrr/gfrr_lite_{data_name}{suffix}_best.pt'
     os.makedirs('checkpoints_gfrr', exist_ok=True)
     
     for epoch in range(epochs):
-        avg_loss, loss_comp = train_epoch(model, train_loader, criterion, optimizer, DEVICE)
+        avg_loss, loss_comp = train_epoch(
+            model, train_loader, criterion, optimizer, DEVICE,
+            use_forward=use_forward,
+            epoch=epoch,
+            warmup_epochs=FORWARD_WARMUP_EPOCHS
+        )
         
         best_th, _ = find_optimal_threshold_gfrr(model, val_loader, DEVICE,
                                                   dist_matrix=dist_matrix)
@@ -225,9 +281,23 @@ def main():
         
         # 打印进度
         recall_str = " | ".join([f"R@{k}: {val_metrics[f'recall@{k}']:.3f}" for k in RECALL_K_VALUES])
-        log_print(logger, f"Epoch {epoch+1:03d} | Loss: {avg_loss:.4f} "
-              f"(BCE:{loss_comp['bce']:.3f}, Rank:{loss_comp['rank']:.3f}) | "
-              f"Val F1: {val_metrics['f1']:.4f} | {recall_str}")
+        
+        # 根据是否使用前向生成器调整打印格式
+        if use_forward and epoch >= FORWARD_WARMUP_EPOCHS:
+            log_print(logger, f"Epoch {epoch+1:03d} | Loss: {avg_loss:.4f} "
+                  f"(BCE:{loss_comp['bce']:.3f}, Rank:{loss_comp['rank']:.3f}, "
+                  f"Fwd:{loss_comp['forward']:.3f}) | "
+                  f"Val F1: {val_metrics['f1']:.4f} | {recall_str}")
+        else:
+            log_print(logger, f"Epoch {epoch+1:03d} | Loss: {avg_loss:.4f} "
+                  f"(BCE:{loss_comp['bce']:.3f}, Rank:{loss_comp['rank']:.3f}) | "
+                  f"Val F1: {val_metrics['f1']:.4f} | {recall_str}")
+        
+        # 打印前向生成器的感染烈度 (如果启用)
+        if use_forward and epoch >= FORWARD_WARMUP_EPOCHS and (epoch + 1) % 10 == 0:
+            beta_val = model.get_propagator_beta()
+            if beta_val is not None:
+                log_print(logger, f"    [Propagator] β={beta_val:.4f}")
     
     log_print(logger, f"[*] 最佳 Val F1: {best_val_f1:.4f} @ Epoch {best_epoch}")
     

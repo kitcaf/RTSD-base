@@ -101,6 +101,66 @@ POS_WEIGHT_MIN = 2.0           # 最小权重
 POS_WEIGHT_MAX = 50.0          # 最大权重
 DEFAULT_POS_WEIGHT = 2.0       # Fallback 默认权重
 
+# ===== 前向生成器配置 =====
+USE_FORWARD_GENERATOR = False  # 是否启用前向生成器 (默认 False, 训练时可设为 True)
+FORWARD_WARMUP_EPOCHS = 20     # 后向判别器预热轮数 (前 N 轮只训练后向)
+
+# 各数据集的前向生成器配置
+FORWARD_GENERATOR_CONFIGS = {
+    'android': {
+        'k_steps': 3,              # SI 传播步数 (根据 1-2 跳数据洞察)
+        'beta_init': 1.0,          # 初始感染烈度
+        'infection_rate_hidden': 16,  # 传染率预测器隐藏层维度
+    },
+    'christianity': {
+        'k_steps': 2,              # 源点更显著, 传播更快
+        'beta_init': 1.2,
+        'infection_rate_hidden': 16,
+    },
+    'douban': {
+        'k_steps': 3,
+        'beta_init': 0.8,          # 梯度平原, 传播较慢
+        'infection_rate_hidden': 16,
+    },
+    'twitter': {
+        'k_steps': 3,
+        'beta_init': 1.0,
+        'infection_rate_hidden': 16,
+    }
+}
+
+# 各数据集的前向损失配置
+FORWARD_LOSS_CONFIGS = {
+    'android': {
+        'lambda_forward': 0.5,     # 前向损失总权重
+        'lambda_focal': 1.0,       # Focal Loss 权重
+        'lambda_dice': 0.5,        # Dice Loss 权重
+        'focal_alpha': 0.25,       # Focal Loss α (正样本权重)
+        'focal_gamma': 2.0,        # Focal Loss γ (聚焦参数)
+    },
+    'christianity': {
+        'lambda_forward': 0.3,     # 源点显著, 降低前向权重
+        'lambda_focal': 1.0,
+        'lambda_dice': 0.5,
+        'focal_alpha': 0.25,
+        'focal_gamma': 2.0,
+    },
+    'douban': {
+        'lambda_forward': 0.6,     # 梯度平原, 增强前向约束
+        'lambda_focal': 1.0,
+        'lambda_dice': 0.5,
+        'focal_alpha': 0.25,
+        'focal_gamma': 2.0,
+    },
+    'twitter': {
+        'lambda_forward': 0.5,
+        'lambda_focal': 1.0,
+        'lambda_dice': 0.5,
+        'focal_alpha': 0.25,
+        'focal_gamma': 2.0,
+    }
+}
+
 
 
 # ==================== 辅助函数 ====================
@@ -111,3 +171,11 @@ def get_gfrr_arch_config():
 def get_gfrr_loss_config():
     """获取当前数据集的 GFRR 损失函数配置"""
     return GFRR_LOSS_CONFIGS[DATASET_NAMES[DATASET_IDX]]
+
+def get_forward_generator_config():
+    """获取当前数据集的前向生成器配置"""
+    return FORWARD_GENERATOR_CONFIGS[DATASET_NAMES[DATASET_IDX]]
+
+def get_forward_loss_config():
+    """获取当前数据集的前向损失配置"""
+    return FORWARD_LOSS_CONFIGS[DATASET_NAMES[DATASET_IDX]]
