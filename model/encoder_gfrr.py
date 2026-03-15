@@ -272,7 +272,83 @@ class PIRAResidualBlock(nn.Module):
 
 
 # ==========================================
-# 4. 门控融合模块
+# 4. CC Pooling 模块
+# ==========================================
+class CCPooling(nn.Module):
+    """
+    连通分量池化层
+    
+    功能：聚合同一CC内所有节点的embedding，生成CC级表示
+    """
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        
+        # CC表示的可学习权重
+        self.cc_transform = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # 融合权重（控制CC信息的注入强度）
+        self.alpha = nn.Parameter(torch.tensor(0.3))
+    
+    def forward(self, z_node, cc_labels, train_mask):
+        """
+        Args:
+            z_node: 节点级embedding [N, D]
+            cc_labels: CC标签 [N]，-1表示未感染节点
+            train_mask: 感染节点掩码 [N]
+        
+        Returns:
+            z_enhanced: CC感知的节点embedding [N, D]
+            z_cc_dict: CC级embedding字典 {cc_id: tensor}
+        """
+        device = z_node.device
+        N, D = z_node.shape
+        
+        # 只处理感染节点
+        infected_indices = torch.where(train_mask)[0]
+        if len(infected_indices) == 0:
+            return z_node, {}
+        
+        # 获取所有CC的ID
+        cc_ids_infected = cc_labels[infected_indices]
+        unique_cc_ids = torch.unique(cc_ids_infected[cc_ids_infected >= 0])
+        
+        # 为每个CC计算pooled embedding
+        z_cc_dict = {}
+        z_cc_broadcast = torch.zeros_like(z_node)
+        
+        for cc_id in unique_cc_ids:
+            cc_id_val = cc_id.item()
+            # 找到属于该CC的所有节点
+            cc_mask = (cc_labels == cc_id_val) & train_mask
+            cc_node_indices = torch.where(cc_mask)[0]
+            
+            if len(cc_node_indices) > 0:
+                # 聚合该CC内所有节点的embedding（平均池化）
+                z_cc = z_node[cc_node_indices].mean(dim=0, keepdim=True)  # [1, D]
+                
+                # 通过MLP变换
+                z_cc_transformed = self.cc_transform(z_cc)  # [1, D]
+                
+                # 保存CC级表示
+                z_cc_dict[cc_id_val] = z_cc_transformed.squeeze(0)
+                
+                # 广播回该CC的所有节点
+                z_cc_broadcast[cc_node_indices] = z_cc_transformed
+        
+        # 融合节点级和CC级表示
+        alpha_clamped = torch.sigmoid(self.alpha)  # 限制在[0,1]
+        z_enhanced = z_node + alpha_clamped * z_cc_broadcast
+        
+        return z_enhanced, z_cc_dict
+
+
+# ==========================================
+# 5. 门控融合模块
 # ==========================================
 class GatedFusion(nn.Module):
     """
@@ -305,7 +381,7 @@ class GatedFusion(nn.Module):
 
 
 # ==========================================
-# 5. GFRR Encoder 主模型
+# 6. GFRR Encoder 主模型
 # ==========================================
 class GFRREncoder(nn.Module):
     """
@@ -317,6 +393,8 @@ class GFRREncoder(nn.Module):
         DualChannelInput (State + Topo)
             ↓
         GAT Residual Blocks × num_blocks
+            ↓
+        CC Pooling (连通分量感知)
             ↓
         GatedFusion (多尺度融合)
             ↓
@@ -370,10 +448,13 @@ class GFRREncoder(nn.Module):
             for _ in range(num_blocks)
         ])
         
+        # CC Pooling层
+        self.cc_pooling = CCPooling(hidden_dim)
+        
         # 门控融合
         self.gated_fusion = GatedFusion(hidden_dim)
     
-    def forward(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None):
+    def forward(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None, cc_labels=None, train_mask=None):
         """
         前向传播
         
@@ -383,9 +464,12 @@ class GFRREncoder(nn.Module):
             k_inf: 感染邻居数 [N] (PIRA 梯度信号, 可选)
             edge_dist: 边距离 [E] (可选)
             degrees: 节点度数 [N] (可选)
+            cc_labels: CC标签 [N] (可选)
+            train_mask: 感染节点掩码 [N] (可选)
             
         Returns:
             z: 潜在表示 [N, hidden_dim]
+            z_cc_dict: CC级embedding字典 (用于对比损失)
             gate_weights: 门控权重 [N, 1] (可选, 用于分析)
         """
         # 双通道输入
@@ -397,12 +481,20 @@ class GFRREncoder(nn.Module):
             h = block(h, edge_index, k_inf=k_inf, edge_dist=edge_dist, degrees=degrees)
             layer_outputs.append(h)
         
-        # 门控融合 (融合第一层和最后一层)
-        z, gate_weights = self.gated_fusion(layer_outputs[0], layer_outputs[-1])
+        # CC Pooling (连通分量感知)
+        z_cc_dict = {}
+        if cc_labels is not None and train_mask is not None:
+            h_cc_enhanced, z_cc_dict = self.cc_pooling(layer_outputs[-1], cc_labels, train_mask)
+        else:
+            h_cc_enhanced = layer_outputs[-1]
         
-        return z, gate_weights
+        # 门控融合 (融合第一层和CC增强后的最后一层)
+        z, gate_weights = self.gated_fusion(layer_outputs[0], h_cc_enhanced)
+        
+        return z, z_cc_dict, gate_weights
     
-    def encode(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None):
+    def encode(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None, cc_labels=None, train_mask=None):
         """简化接口: 仅返回潜在表示"""
-        z, _ = self.forward(x, edge_index, k_inf=k_inf, edge_dist=edge_dist, degrees=degrees)
-        return z
+        z, z_cc_dict, _ = self.forward(x, edge_index, k_inf=k_inf, edge_dist=edge_dist, degrees=degrees, 
+                                        cc_labels=cc_labels, train_mask=train_mask)
+        return z, z_cc_dict

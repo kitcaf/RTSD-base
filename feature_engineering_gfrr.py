@@ -9,6 +9,7 @@ GFRR 特征工程模块
         - 传播相关特征设为初始值 (0 或合理默认值)
 """
 import numpy as np
+import scipy.sparse as sp
 import networkx as nx
 import torch
 import os
@@ -140,6 +141,34 @@ class FeatureEngineerGFRR:
         
         return closeness, eccentricity, max(max_ecc, 1.0)
     
+    def _extract_cc_info(self, infected_indices):
+        """
+        提取连通分量信息
+        
+        Args:
+            infected_indices: 感染节点索引
+        
+        Returns:
+            cc_labels: [N] CC标签 (-1表示未感染节点)
+            max_cc_id: 最大CC的ID
+            cc_sizes: 每个CC的大小
+        """
+        from scipy.sparse.csgraph import connected_components
+        
+        # 构建感染子图
+        subgraph = self.adj_matrix[np.ix_(infected_indices, infected_indices)]
+        n_cc, cc_labels_local = connected_components(subgraph, directed=False)
+        
+        # 映射到全图节点
+        cc_labels = np.full(self.num_nodes, -1, dtype=int)
+        cc_labels[infected_indices] = cc_labels_local
+        
+        # 统计每个CC大小
+        cc_sizes = np.bincount(cc_labels_local)
+        max_cc_id = np.argmax(cc_sizes)
+        
+        return cc_labels, max_cc_id, cc_sizes
+    
     def _build_observed_features(self, infected_indices, source_indices):
         """
         构建观测态特征 (基于感染快照)
@@ -151,8 +180,13 @@ class FeatureEngineerGFRR:
         Returns:
             x_observed: [N, 14] 观测态特征
             k_inf_tensor: [N] 感染邻居数
+            cc_labels: [N] CC标签
+            max_cc_id: 最大CC的ID
         """
         infected_set = set(infected_indices)
+        
+        # 提取CC信息
+        cc_labels, max_cc_id, cc_sizes = self._extract_cc_info(infected_indices)
         ALPHA = 2.0
         
         # 计算子图特征
@@ -235,7 +269,7 @@ class FeatureEngineerGFRR:
                 sg_closeness, sg_eccentricity, outward_ratio
             ]
         
-        return x_observed, torch.FloatTensor(k_inf_all)
+        return x_observed, torch.FloatTensor(k_inf_all), cc_labels, max_cc_id
     
     def _build_source_features(self, source_indices):
         """
@@ -311,7 +345,7 @@ class FeatureEngineerGFRR:
         
         return x_source
     
-    def generate_dataset(self, influ_list, cache_name=None, cache_dir='data', use_gfrr=True, k_hop=2):
+    def generate_dataset(self, influ_list, cache_name=None, cache_dir='data', use_gfrr=True):
         """
         生成特征数据集
         
@@ -348,16 +382,12 @@ class FeatureEngineerGFRR:
                 except Exception as e:
                     print(f"[!] 缓存加载失败: {e}, 重新计算...")
         
-        print(f"[*] 构建 GFRR 特征数据集 (use_gfrr={use_gfrr}, k_hop={k_hop}, 多快照模式)...")
+        print(f"[*] 构建 GFRR 特征数据集 (use_gfrr={use_gfrr}, 多快照模式)...")
         dataset = []
         
-        from metrics_utils import precompute_shortest_paths
-        dist_matrix = precompute_shortest_paths(self.adj_matrix)
-        
-        # 构建 K-hop 虚拟图
-        rows, cols = np.where((dist_matrix > 0) & (dist_matrix <= k_hop))
-        edge_index = torch.LongTensor(np.array([rows, cols]))
-        edge_dist = torch.FloatTensor(dist_matrix[rows, cols])
+        # 使用原始邻接矩阵构建边索引（全图）
+        adj_coo = sp.coo_matrix(self.adj_matrix)
+        edge_index = torch.LongTensor(np.array([adj_coo.row, adj_coo.col]))
         node_degrees = torch.FloatTensor(self.degrees)
         
         for cascade_idx, mat in enumerate(influ_list):
@@ -388,7 +418,7 @@ class FeatureEngineerGFRR:
                 is_final = (t_idx == n_snapshot_cols - 1)
 
                 # 构建观测态特征
-                x_observed, k_inf_tensor = self._build_observed_features(infected_indices, source_indices)
+                x_observed, k_inf_tensor, cc_labels, max_cc_id = self._build_observed_features(infected_indices, source_indices)
 
                 # 感染掩码
                 train_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
@@ -397,11 +427,12 @@ class FeatureEngineerGFRR:
                 data = Data(
                     x=torch.FloatTensor(x_observed),
                     edge_index=edge_index,
-                    edge_dist=edge_dist,
                     degrees=node_degrees,
                     y=torch.FloatTensor(y_np),
                     train_mask=train_mask,
-                    k_inf=k_inf_tensor
+                    k_inf=k_inf_tensor,
+                    cc_labels=torch.LongTensor(cc_labels),
+                    max_cc_id=max_cc_id
                 )
 
                 # 标记 cascade_id 和 is_final，训练/推理分流用

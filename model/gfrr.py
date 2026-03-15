@@ -70,9 +70,16 @@ class GFRRLite(nn.Module):
         k_inf = data.k_inf if hasattr(data, 'k_inf') else None
         edge_dist = data.edge_dist if hasattr(data, 'edge_dist') else None
         degrees = data.degrees if hasattr(data, 'degrees') else None
-        z, _ = self.encoder(data.x, data.edge_index, k_inf=k_inf, edge_dist=edge_dist, degrees=degrees)
+        cc_labels = data.cc_labels if hasattr(data, 'cc_labels') else None
+        train_mask = data.train_mask if hasattr(data, 'train_mask') else None
+        
+        z, z_cc_dict, _ = self.encoder(
+            data.x, data.edge_index, 
+            k_inf=k_inf, edge_dist=edge_dist, degrees=degrees,
+            cc_labels=cc_labels, train_mask=train_mask
+        )
         logits = self.class_head(z)
-        return logits
+        return logits, z_cc_dict
     
     def get_num_params(self):
         """获取模型参数数量"""

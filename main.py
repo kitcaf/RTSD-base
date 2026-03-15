@@ -41,20 +41,26 @@ def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
     
     total_loss = 0
-    loss_components = {'cls': 0, 'bce': 0, 'rank': 0}
+    loss_components = {'cls': 0, 'bce': 0, 'rank': 0, 'cc_contrast': 0}
     num_batches = 0
     
     for data in loader:
         data = data.to(device)
         optimizer.zero_grad()
         
-        logits = model(data)
+        logits, z_cc_dict = model(data)
         
         mask = data.train_mask
         if mask.sum() > 0:
+            # 只在最终快照上计算CC对比损失
+            is_final = data.is_final if hasattr(data, 'is_final') else True
+            
             loss_dict = criterion(
                 logits, data.y, mask,
-                k_inf=data.k_inf if hasattr(data, 'k_inf') else None
+                k_inf=data.k_inf if hasattr(data, 'k_inf') else None,
+                z_cc_dict=z_cc_dict if (z_cc_dict and is_final) else None,
+                cc_labels=data.cc_labels if (hasattr(data, 'cc_labels') and is_final) else None,
+                max_cc_id=data.max_cc_id if (hasattr(data, 'max_cc_id') and is_final) else None
             )
             
             loss = loss_dict['total']
@@ -98,17 +104,16 @@ def main():
     log_print(logger, f"[*] 数据集: {data_name}")
     log_print(logger, f"    节点数: {adj.shape[0]}, 级联数: {len(influ)}")
     
-    # 获取配置 (提前读取以获取 k_hop)
+    # 获取配置
     arch_config = get_gfrr_arch_config()
     loss_config = get_gfrr_loss_config()
     
-    # 特征工程 (与完整版完全一致)
+    # 特征工程
     engineer = FeatureEngineerGFRR(adj)
     dataset = engineer.generate_dataset(
         influ, 
         cache_name=data_name, 
-        use_gfrr=True,
-        k_hop=arch_config.get('k_hop', 2)
+        use_gfrr=False
     )
     
     # 预计算最短路径 (与完整版完全一致)
@@ -139,6 +144,42 @@ def main():
     val_loader = DataLoader(val_set, batch_size=1)
     test_loader = DataLoader(test_set, batch_size=1)
     
+    # 统计训练集和验证集的CC分布
+    log_print(logger, "[*] 统计CC分布...")
+    train_cc_stats = []
+    train_final_cc_stats = []
+    for data in train_set:
+        if hasattr(data, 'cc_labels'):
+            cc_labels = data.cc_labels.numpy()
+            infected_mask = data.train_mask.numpy()
+            unique_ccs = np.unique(cc_labels[infected_mask])
+            unique_ccs = unique_ccs[unique_ccs >= 0]
+            train_cc_stats.append(len(unique_ccs))
+            if data.is_final:
+                train_final_cc_stats.append(len(unique_ccs))
+    
+    val_cc_stats = []
+    for data in val_set:
+        if hasattr(data, 'cc_labels'):
+            cc_labels = data.cc_labels.numpy()
+            infected_mask = data.train_mask.numpy()
+            unique_ccs = np.unique(cc_labels[infected_mask])
+            unique_ccs = unique_ccs[unique_ccs >= 0]
+            val_cc_stats.append(len(unique_ccs))
+    
+    if train_cc_stats:
+        log_print(logger, f"    训练集(所有快照) - 平均CC数: {np.mean(train_cc_stats):.2f}, "
+                         f"单CC样本: {sum(1 for x in train_cc_stats if x == 1)}/{len(train_cc_stats)} "
+                         f"({100*sum(1 for x in train_cc_stats if x == 1)/len(train_cc_stats):.1f}%)")
+    if train_final_cc_stats:
+        log_print(logger, f"    训练集(最终快照) - 平均CC数: {np.mean(train_final_cc_stats):.2f}, "
+                         f"单CC样本: {sum(1 for x in train_final_cc_stats if x == 1)}/{len(train_final_cc_stats)} "
+                         f"({100*sum(1 for x in train_final_cc_stats if x == 1)/len(train_final_cc_stats):.1f}%)")
+    if val_cc_stats:
+        log_print(logger, f"    验证集(最终快照) - 平均CC数: {np.mean(val_cc_stats):.2f}, "
+                         f"单CC样本: {sum(1 for x in val_cc_stats if x == 1)}/{len(val_cc_stats)} "
+                         f"({100*sum(1 for x in val_cc_stats if x == 1)/len(val_cc_stats):.1f}%)")
+    
     # 确定 pos_weight (与完整版完全一致)
     if USE_DYNAMIC_POS_WEIGHT:
         pos_weight, _ = compute_dynamic_pos_weight(train_set)
@@ -167,7 +208,9 @@ def main():
     criterion = GFRRLoss(
         pos_weight=pos_weight,
         lambda_rank=loss_config.get('lambda_rank', 0.1),
-        margin=loss_config.get('margin', 0.15)
+        margin=loss_config.get('margin', 0.15),
+        lambda_cc=loss_config.get('lambda_cc', 0.2),
+        temperature=loss_config.get('temperature', 0.1)
     ).to(DEVICE)
     
     # 优化器 (与完整版完全一致)
@@ -188,7 +231,6 @@ def main():
     log_print(logger, f"      pos_weight: {pos_weight}")
     log_print(logger, f"      hidden_dim: {arch_config.get('hidden_dim', 32)}")
     log_print(logger, f"      encoder_blocks: {arch_config.get('encoder_blocks', 3)}")
-    log_print(logger, f"      K-hop 图: {arch_config.get('k_hop', 2)}")
     log_print(logger, f"      PIRA 参数: beta={arch_config.get('beta', 1.0)}, L1={arch_config.get('lambda_1', 0.5)}, L2={arch_config.get('lambda_2', 1.0)}")
     log_print(logger, f"      数据划分: cascade_id 分组 (Train=全快照, Val/Test=仅最终快照)")
     log_print(logger, f"{'='*60}\n")
@@ -226,7 +268,7 @@ def main():
         # 打印进度
         recall_str = " | ".join([f"R@{k}: {val_metrics[f'recall@{k}']:.3f}" for k in RECALL_K_VALUES])
         log_print(logger, f"Epoch {epoch+1:03d} | Loss: {avg_loss:.4f} "
-              f"(BCE:{loss_comp['bce']:.3f}, Rank:{loss_comp['rank']:.3f}) | "
+              f"(BCE:{loss_comp['bce']:.3f}, Rank:{loss_comp['rank']:.3f}, CC:{loss_comp['cc_contrast']:.3f}) | "
               f"Val F1: {val_metrics['f1']:.4f} | {recall_str}")
     
     log_print(logger, f"[*] 最佳 Val F1: {best_val_f1:.4f} @ Epoch {best_epoch}")

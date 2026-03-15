@@ -76,21 +76,29 @@ GFRR_LOSS_CONFIGS = {
         'lambda_rank': 2.0,        # Ranking Loss 权重
         'margin': 0.5,             # Ranking Loss margin
         'pos_weight': 2.0,         # 静态正样本权重 (保守策略)
+        'lambda_cc': 0.2,          # CC-Contrastive Loss 权重
+        'temperature': 0.1,        # 对比学习温度参数
     },
     'christianity': {
         'lambda_rank': 0.2,
         'margin': 0.2,
         'pos_weight': 5.43,        # 接近真实正负样本比 (~1:5)
+        'lambda_cc': 0.15,         # Christianity连通性好，CC对比权重可稍低
+        'temperature': 0.1,
     },
     'douban': {
         'lambda_rank': 1.5,
         'margin': 0.3,
         'pos_weight': 2.5,
+        'lambda_cc': 0.25,         # Douban碎片化严重，CC对比权重稍高
+        'temperature': 0.1,
     },
     'twitter': {
         'lambda_rank': 0.8,
         'margin': 0.3,
         'pos_weight': 2.5,         # 源点较密集 (~1:4)
+        'lambda_cc': 0.2,
+        'temperature': 0.1,
     }
 }
 

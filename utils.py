@@ -138,8 +138,12 @@ def find_optimal_threshold_gfrr(model, loader, device, dist_matrix=None):
         for data in loader:
             data = data.to(device)
             
-            # GFRR 使用 forward
-            logits = model(data)
+            # GFRR 使用 forward (返回logits和z_cc_dict)
+            output = model(data)
+            if isinstance(output, tuple):
+                logits, _ = output
+            else:
+                logits = output
             probs = torch.sigmoid(logits)
             
             mask = data.train_mask
@@ -224,7 +228,12 @@ def evaluate_gfrr(model, loader, device, threshold=0.5,
                 
                 logits_sum = None
                 for _ in range(mc_dropout_samples):
-                    curr_logits = model(data)
+                    output = model(data)
+                    if isinstance(output, tuple):
+                        curr_logits, _ = output
+                    else:
+                        curr_logits = output
+                    
                     if logits_sum is None:
                         logits_sum = curr_logits
                     else:
@@ -236,7 +245,11 @@ def evaluate_gfrr(model, loader, device, threshold=0.5,
                 model.eval()
             else:
                 # --- 标准确定性推理 ---
-                logits = model(data)
+                output = model(data)
+                if isinstance(output, tuple):
+                    logits, _ = output
+                else:
+                    logits = output
 
             probs = torch.sigmoid(logits)
             
