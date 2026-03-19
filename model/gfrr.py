@@ -3,7 +3,6 @@ GFRR 主模型: Encoder + ClassificationHead
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .encoder_gfrr import GFRREncoder
 
@@ -45,10 +44,7 @@ class GFRRLite(nn.Module):
         num_features: int = 14,
         hidden_dim: int = 32,
         encoder_blocks: int = 3,
-        dropout: float = 0.3,
-        beta: float = 1.0,
-        lambda_1: float = 0.5,
-        lambda_2: float = 1.0
+        dropout: float = 0.3
     ):
         super().__init__()
         
@@ -58,28 +54,15 @@ class GFRRLite(nn.Module):
             num_features=num_features,
             hidden_dim=hidden_dim,
             num_blocks=encoder_blocks,
-            dropout=dropout,
-            beta=beta,
-            lambda_1=lambda_1,
-            lambda_2=lambda_2
+            dropout=dropout
         )
         
         self.class_head = ClassificationHead(hidden_dim, dropout)
     
     def forward(self, data):
-        k_inf = data.k_inf if hasattr(data, 'k_inf') else None
-        edge_dist = data.edge_dist if hasattr(data, 'edge_dist') else None
-        degrees = data.degrees if hasattr(data, 'degrees') else None
-        cc_labels = data.cc_labels if hasattr(data, 'cc_labels') else None
-        train_mask = data.train_mask if hasattr(data, 'train_mask') else None
-        
-        z, z_cc_dict, gate_weights = self.encoder(
-            data.x, data.edge_index, 
-            k_inf=k_inf, edge_dist=edge_dist, degrees=degrees,
-            cc_labels=cc_labels, train_mask=train_mask
-        )
+        z, gate_weights = self.encoder(data.x, data.edge_index)
         logits = self.class_head(z)
-        return logits, z_cc_dict
+        return logits
     
     def get_num_params(self):
         """获取模型参数数量"""

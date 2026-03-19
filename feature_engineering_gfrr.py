@@ -164,34 +164,6 @@ class FeatureEngineerGFRR:
         """返回当前特征维度"""
         return 13 if self.ablation_feature_idx is not None else 14
     
-    def _extract_cc_info(self, infected_indices):
-        """
-        提取连通分量信息
-        
-        Args:
-            infected_indices: 感染节点索引
-        
-        Returns:
-            cc_labels: [N] CC标签 (-1表示未感染节点)
-            max_cc_id: 最大CC的ID
-            cc_sizes: 每个CC的大小
-        """
-        from scipy.sparse.csgraph import connected_components
-        
-        # 构建感染子图
-        subgraph = self.adj_matrix[np.ix_(infected_indices, infected_indices)]
-        n_cc, cc_labels_local = connected_components(subgraph, directed=False)
-        
-        # 映射到全图节点
-        cc_labels = np.full(self.num_nodes, -1, dtype=int)
-        cc_labels[infected_indices] = cc_labels_local
-        
-        # 统计每个CC大小
-        cc_sizes = np.bincount(cc_labels_local)
-        max_cc_id = np.argmax(cc_sizes)
-        
-        return cc_labels, max_cc_id, cc_sizes
-    
     def _build_observed_features(self, infected_indices, source_indices):
         """
         构建观测态特征 (基于感染快照)
@@ -203,13 +175,9 @@ class FeatureEngineerGFRR:
         Returns:
             x_observed: [N, 14] 观测态特征
             k_inf_tensor: [N] 感染邻居数
-            cc_labels: [N] CC标签
-            max_cc_id: 最大CC的ID
         """
         infected_set = set(infected_indices)
-        
-        # 提取CC信息
-        cc_labels, max_cc_id, cc_sizes = self._extract_cc_info(infected_indices)
+
         ALPHA = 2.0
         
         # 计算子图特征
@@ -295,8 +263,8 @@ class FeatureEngineerGFRR:
         # 应用特征消融
         if self.ablation_feature_idx is not None:
             x_observed = self._apply_ablation(x_observed)
-        
-        return x_observed, torch.FloatTensor(k_inf_all), cc_labels, max_cc_id
+
+        return x_observed, torch.FloatTensor(k_inf_all)
     
     def _build_source_features(self, source_indices):
         """
@@ -449,7 +417,7 @@ class FeatureEngineerGFRR:
                 is_final = (t_idx == n_snapshot_cols - 1)
 
                 # 构建观测态特征
-                x_observed, k_inf_tensor, cc_labels, max_cc_id = self._build_observed_features(infected_indices, source_indices)
+                x_observed, k_inf_tensor = self._build_observed_features(infected_indices, source_indices)
 
                 # 感染掩码
                 train_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
@@ -461,9 +429,7 @@ class FeatureEngineerGFRR:
                     degrees=node_degrees,
                     y=torch.FloatTensor(y_np),
                     train_mask=train_mask,
-                    k_inf=k_inf_tensor,
-                    cc_labels=torch.LongTensor(cc_labels),
-                    max_cc_id=max_cc_id
+                    k_inf=k_inf_tensor
                 )
 
                 # 标记 cascade_id 和 is_final，训练/推理分流用

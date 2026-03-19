@@ -243,7 +243,7 @@ def main():
         # 使用当前级联的子图去实例化 FeatureEngineer
         engineer = FeatureEngineerGFRR(adj_sub)
         
-        # 直接使用真实图边（不构建 K-hop 虚拟图）
+        # 直接使用真实图边
         rows, cols = np.where(adj_sub > 0)
         edge_index = torch.LongTensor(np.array([rows, cols]))
         edge_dist = torch.ones(edge_index.size(1), dtype=torch.float32)

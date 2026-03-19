@@ -5,7 +5,7 @@ GFRR Encoder 模块
 设计原则:
     1. 双通道输入: StateEmbedding + TopoProjection
     2. SE-Block 特征重校准
-    3. GAT 残差块提取图结构特征
+    3. 原始 GATv2 残差块提取图结构特征
     4. GatedFusion 多尺度融合
 """
 import torch
@@ -17,22 +17,11 @@ from torch_geometric.utils import softmax, add_self_loops, remove_self_loops
 
 
 # ==========================================
-# 1. PIRA Layer (传播逆向推理注意力层)
+# 1. GATv2 Layer
 # ==========================================
-class PIRALayer(MessagePassing):
+class GATv2Layer(MessagePassing):
     """
-    Propagation Inverse Reasoning Attention (PIRA) Layer
-    
-    核心创新: 在 GATv2 注意力中注入 "感染密度梯度" 偏置
-    
-    公式:
-        α_ij = softmax(LeakyReLU(a^T [W_l·h_i + W_r·h_j]) + β · Δk(i,j))
-        Δk(i,j) = k_inf_norm(j) - k_inf_norm(i)  (感染密度梯度)
-    
-    直觉:
-        - 源点: 四周邻居感染密度相近 → 梯度小 → 均匀接收
-        - 边缘节点: 一侧密度高一侧低 → 梯度大 → 偏向高密度侧
-        - 效果: 信息沿感染密度梯度方向 (边缘→源头) 逐层聚合
+    原始 GATv2 风格注意力层（不使用感染密度梯度偏置）。
     """
     def __init__(
         self,
@@ -44,9 +33,6 @@ class PIRALayer(MessagePassing):
         dropout: float = 0.1,
         add_self_loops: bool = True,
         bias: bool = True,
-        beta: float = 1.0,
-        lambda_1: float = 0.5,
-        lambda_2: float = 1.0,
         **kwargs
     ):
         kwargs.setdefault('aggr', 'add')
@@ -59,9 +45,6 @@ class PIRALayer(MessagePassing):
         self.negative_slope = negative_slope
         self.dropout = dropout
         self._add_self_loops = add_self_loops
-        self.beta = beta
-        self.lambda_1 = lambda_1
-        self.lambda_2 = lambda_2
         
         # 线性变换
         self.lin_l = nn.Linear(in_channels, heads * out_channels, bias=False)
@@ -69,9 +52,6 @@ class PIRALayer(MessagePassing):
         
         # 注意力参数
         self.att = Parameter(torch.Tensor(1, heads, out_channels))
-        
-        # PIRA: 可学习的感染梯度偏置 (per-head)
-        self.gradient_bias = Parameter(torch.ones(heads) * 0.1)
         
         # 偏置
         if bias and concat:
@@ -90,39 +70,22 @@ class PIRALayer(MessagePassing):
         if self.bias is not None:
             nn.init.zeros_(self.bias)
     
-    def forward(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None):
+    def forward(self, x, edge_index):
         """
         Args:
             x: 节点特征 [N, C]
             edge_index: 边索引 [2, E]
-            k_inf: 感染邻居数 [N] (PIRA 梯度信号, 可选)
-            edge_dist: 边距离 [E] (可选)
-            degrees: 节点度数 [N] (可选)
         """
         N = x.size(0)
         
         if self._add_self_loops:
-            if edge_dist is not None:
-                # 同步扩展 edge_dist，自环距离填 1.0（log(1.0)=0，无惩罚）
-                edge_index, edge_dist = remove_self_loops(edge_index, edge_dist)
-                edge_index, edge_dist = add_self_loops(
-                    edge_index, edge_dist, fill_value=1.0, num_nodes=N
-                )
-            else:
-                edge_index, _ = remove_self_loops(edge_index)
-                edge_index, _ = add_self_loops(edge_index, num_nodes=N)
-        
-        # 归一化 k_inf 到 [0, 1]
-        if k_inf is not None:
-            k_inf_max = k_inf.max().clamp(min=1.0)
-            k_inf_norm = k_inf / k_inf_max  # [N]
-        else:
-            k_inf_norm = torch.zeros(N, device=x.device)
+            edge_index, _ = remove_self_loops(edge_index)
+            edge_index, _ = add_self_loops(edge_index, num_nodes=N)
         
         x_l = self.lin_l(x).view(-1, self.heads, self.out_channels)
         x_r = self.lin_r(x).view(-1, self.heads, self.out_channels)
         
-        out = self.propagate(edge_index, x=(x_l, x_r), k_inf_norm=k_inf_norm, edge_dist=edge_dist, degrees=degrees, size=None)
+        out = self.propagate(edge_index, x=(x_l, x_r), size=None)
         
         if self.concat:
             out = out.view(-1, self.heads * self.out_channels)
@@ -134,26 +97,11 @@ class PIRALayer(MessagePassing):
         
         return out
     
-    def message(self, x_i, x_j, k_inf_norm_i, k_inf_norm_j, edge_dist, degrees_j, index, ptr, size_i):
+    def message(self, x_i, x_j, index, ptr, size_i):
         # GATv2 注意力
         x_sum = x_i + x_j
         x_sum = F.leaky_relu(x_sum, negative_slope=self.negative_slope)
         alpha = (x_sum * self.att).sum(dim=-1)  # [E, heads]
-        
-        # PIRA: 感染密度梯度偏置
-        # Δk = k_inf(j) - k_inf(i): 当邻居j感染密度 > 自身i时, 注意力增强
-        # 效果: 低密度节点更关注高密度邻居 → 信息从边缘回溯到源头
-        delta_kinf = (k_inf_norm_j - k_inf_norm_i)  # [E]
-        alpha = alpha + self.gradient_bias * self.beta * delta_kinf.unsqueeze(-1)  # [E, heads]
-        
-        # Topology-aware Attention (距离衰减与大V防虹吸度数阻尼)
-        if edge_dist is not None:
-            dist_penalty = self.lambda_1 * torch.log(edge_dist.clamp(min=1.0))
-            alpha = alpha - dist_penalty.unsqueeze(-1)
-            
-        if degrees_j is not None:
-            deg_penalty = self.lambda_2 * torch.log(degrees_j + 1.0)
-            alpha = alpha - deg_penalty.unsqueeze(-1)
         
         alpha = softmax(alpha, index, ptr, size_i)
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)
@@ -238,33 +186,30 @@ class DualChannelInput(nn.Module):
 
 
 # ==========================================
-# 3. PIRA 残差块
+# 3. GATv2 残差块
 # ==========================================
 class PIRAResidualBlock(nn.Module):
     """
-    PIRA 残差块
+    GATv2 残差块
     
-    架构: PIRALayer -> LeakyReLU -> Dropout + Skip Connection
+    架构: GATv2Layer -> LeakyReLU -> Dropout + Skip Connection
     """
-    def __init__(self, channels, heads=4, dropout=0.3, beta=1.0, lambda_1=0.5, lambda_2=1.0):
+    def __init__(self, channels, heads=4, dropout=0.3):
         super().__init__()
         
         out_per_head = channels // heads
-        self.pira = PIRALayer(
+        self.gat = GATv2Layer(
             in_channels=channels,
             out_channels=out_per_head,
             heads=heads,
             concat=True,
-            dropout=0.1,
-            beta=beta,
-            lambda_1=lambda_1,
-            lambda_2=lambda_2
+            dropout=0.1
         )
         self.activation = nn.LeakyReLU(0.2)
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None):
-        residual = self.pira(x, edge_index, k_inf=k_inf, edge_dist=edge_dist, degrees=degrees)
+    def forward(self, x, edge_index):
+        residual = self.gat(x, edge_index)
         residual = self.activation(residual)
         out = x + residual
         out = self.dropout(out)
@@ -272,83 +217,7 @@ class PIRAResidualBlock(nn.Module):
 
 
 # ==========================================
-# 4. CC Pooling 模块
-# ==========================================
-class CCPooling(nn.Module):
-    """
-    连通分量池化层
-    
-    功能：聚合同一CC内所有节点的embedding，生成CC级表示
-    """
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        
-        # CC表示的可学习权重
-        self.cc_transform = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        
-        # 融合权重（控制CC信息的注入强度）
-        self.alpha = nn.Parameter(torch.tensor(0.3))
-    
-    def forward(self, z_node, cc_labels, train_mask):
-        """
-        Args:
-            z_node: 节点级embedding [N, D]
-            cc_labels: CC标签 [N]，-1表示未感染节点
-            train_mask: 感染节点掩码 [N]
-        
-        Returns:
-            z_enhanced: CC感知的节点embedding [N, D]
-            z_cc_dict: CC级embedding字典 {cc_id: tensor}
-        """
-        device = z_node.device
-        N, D = z_node.shape
-        
-        # 只处理感染节点
-        infected_indices = torch.where(train_mask)[0]
-        if len(infected_indices) == 0:
-            return z_node, {}
-        
-        # 获取所有CC的ID
-        cc_ids_infected = cc_labels[infected_indices]
-        unique_cc_ids = torch.unique(cc_ids_infected[cc_ids_infected >= 0])
-        
-        # 为每个CC计算pooled embedding
-        z_cc_dict = {}
-        z_cc_broadcast = torch.zeros_like(z_node)
-        
-        for cc_id in unique_cc_ids:
-            cc_id_val = cc_id.item()
-            # 找到属于该CC的所有节点
-            cc_mask = (cc_labels == cc_id_val) & train_mask
-            cc_node_indices = torch.where(cc_mask)[0]
-            
-            if len(cc_node_indices) > 0:
-                # 聚合该CC内所有节点的embedding（平均池化）
-                z_cc = z_node[cc_node_indices].mean(dim=0, keepdim=True)  # [1, D]
-                
-                # 通过MLP变换
-                z_cc_transformed = self.cc_transform(z_cc)  # [1, D]
-                
-                # 保存CC级表示
-                z_cc_dict[cc_id_val] = z_cc_transformed.squeeze(0)
-                
-                # 广播回该CC的所有节点
-                z_cc_broadcast[cc_node_indices] = z_cc_transformed
-        
-        # 融合节点级和CC级表示
-        alpha_clamped = torch.sigmoid(self.alpha)  # 限制在[0,1]
-        z_enhanced = z_node + alpha_clamped * z_cc_broadcast
-        
-        return z_enhanced, z_cc_dict
-
-
-# ==========================================
-# 5. 门控融合模块
+# 4. 门控融合模块
 # ==========================================
 class GatedFusion(nn.Module):
     """
@@ -381,7 +250,7 @@ class GatedFusion(nn.Module):
 
 
 # ==========================================
-# 6. GFRR Encoder 主模型
+# 5. GFRR Encoder 主模型
 # ==========================================
 class GFRREncoder(nn.Module):
     """
@@ -392,9 +261,7 @@ class GFRREncoder(nn.Module):
             ↓
         DualChannelInput (State + Topo)
             ↓
-        GAT Residual Blocks × num_blocks
-            ↓
-        CC Pooling (连通分量感知)
+        GATv2 Residual Blocks × num_blocks
             ↓
         GatedFusion (多尺度融合)
             ↓
@@ -405,19 +272,13 @@ class GFRREncoder(nn.Module):
         hidden_dim: 隐藏层维度 (默认 32)
         num_blocks: GAT 残差块数量 (默认 3)
         dropout: Dropout 比例 (默认 0.3)
-        beta: 感染梯度引导系数
-        lambda_1: 物理距离衰减系数
-        lambda_2: 大V防虹吸惩罚系数
     """
     def __init__(
         self,
         num_features: int = 14,
         hidden_dim: int = 32,
         num_blocks: int = 3,
-        dropout: float = 0.3,
-        beta: float = 1.0,
-        lambda_1: float = 0.5,
-        lambda_2: float = 1.0
+        dropout: float = 0.3
     ):
         super().__init__()
         
@@ -435,66 +296,46 @@ class GFRREncoder(nn.Module):
             num_topo_features=num_features - 1  # 除去状态列
         )
         
-        # PIRA 残差块
+        # GATv2 残差块
         self.res_blocks = nn.ModuleList([
             PIRAResidualBlock(
                 hidden_dim, 
                 heads=4, 
-                dropout=dropout, 
-                beta=beta, 
-                lambda_1=lambda_1, 
-                lambda_2=lambda_2
+                dropout=dropout
             )
             for _ in range(num_blocks)
         ])
         
-        # CC Pooling层
-        self.cc_pooling = CCPooling(hidden_dim)
-        
         # 门控融合
         self.gated_fusion = GatedFusion(hidden_dim)
     
-    def forward(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None, cc_labels=None, train_mask=None):
+    def forward(self, x, edge_index):
         """
         前向传播
         
         Args:
             x: 节点特征 [N, 14]
             edge_index: 边索引 [2, E]
-            k_inf: 感染邻居数 [N] (PIRA 梯度信号, 可选)
-            edge_dist: 边距离 [E] (可选)
-            degrees: 节点度数 [N] (可选)
-            cc_labels: CC标签 [N] (可选)
-            train_mask: 感染节点掩码 [N] (可选)
             
         Returns:
             z: 潜在表示 [N, hidden_dim]
-            z_cc_dict: CC级embedding字典 (用于对比损失)
             gate_weights: 门控权重 [N, 1] (可选, 用于分析)
         """
         # 双通道输入
         h = self.input_layer(x)  # [N, 32]
         
-        # PIRA 残差块 (传入 k_inf 作为感染密度梯度信号, edge_dist/degrees作为约束)
+        # GATv2 残差块
         layer_outputs = []
         for block in self.res_blocks:
-            h = block(h, edge_index, k_inf=k_inf, edge_dist=edge_dist, degrees=degrees)
+            h = block(h, edge_index)
             layer_outputs.append(h)
-        
-        # CC Pooling (连通分量感知)
-        z_cc_dict = {}
-        if cc_labels is not None and train_mask is not None:
-            h_cc_enhanced, z_cc_dict = self.cc_pooling(layer_outputs[-1], cc_labels, train_mask)
-        else:
-            h_cc_enhanced = layer_outputs[-1]
-        
-        # 门控融合 (融合第一层和CC增强后的最后一层)
-        z, gate_weights = self.gated_fusion(layer_outputs[0], h_cc_enhanced)
-        
-        return z, z_cc_dict, gate_weights
-    
-    def encode(self, x, edge_index, k_inf=None, edge_dist=None, degrees=None, cc_labels=None, train_mask=None):
+
+        # 门控融合 (融合第一层和最后一层)
+        z, gate_weights = self.gated_fusion(layer_outputs[0], layer_outputs[-1])
+
+        return z, gate_weights
+
+    def encode(self, x, edge_index):
         """简化接口: 仅返回潜在表示"""
-        z, z_cc_dict, _ = self.forward(x, edge_index, k_inf=k_inf, edge_dist=edge_dist, degrees=degrees, 
-                                        cc_labels=cc_labels, train_mask=train_mask)
-        return z, z_cc_dict
+        z, _ = self.forward(x, edge_index)
+        return z

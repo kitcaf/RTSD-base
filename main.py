@@ -41,26 +41,20 @@ def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
     
     total_loss = 0
-    loss_components = {'cls': 0, 'bce': 0, 'rank': 0, 'cc_contrast': 0}
+    loss_components = {'cls': 0, 'bce': 0, 'rank': 0}
     num_batches = 0
     
     for data in loader:
         data = data.to(device)
         optimizer.zero_grad()
         
-        logits, z_cc_dict = model(data)
+        logits = model(data)
         
         mask = data.train_mask
         if mask.sum() > 0:
-            # 只在最终快照上计算CC对比损失
-            is_final = data.is_final if hasattr(data, 'is_final') else True
-            
             loss_dict = criterion(
                 logits, data.y, mask,
-                k_inf=data.k_inf if hasattr(data, 'k_inf') else None,
-                z_cc_dict=z_cc_dict if (z_cc_dict and is_final) else None,
-                cc_labels=data.cc_labels if (hasattr(data, 'cc_labels') and is_final) else None,
-                max_cc_id=data.max_cc_id if (hasattr(data, 'max_cc_id') and is_final) else None
+                k_inf=data.k_inf if hasattr(data, 'k_inf') else None
             )
             
             loss = loss_dict['total']
@@ -192,10 +186,7 @@ def main():
         num_features=14,
         hidden_dim=arch_config.get('hidden_dim', 32),
         encoder_blocks=arch_config.get('encoder_blocks', 3),
-        dropout=arch_config.get('dropout', 0.3),
-        beta=arch_config.get('beta', 1.0),
-        lambda_1=arch_config.get('lambda_1', 0.5),
-        lambda_2=arch_config.get('lambda_2', 1.0)
+        dropout=arch_config.get('dropout', 0.3)
     ).to(DEVICE)
     
     # 打印模型参数
@@ -208,9 +199,7 @@ def main():
     criterion = GFRRLoss(
         pos_weight=pos_weight,
         lambda_rank=loss_config.get('lambda_rank', 0.1),
-        margin=loss_config.get('margin', 0.15),
-        lambda_cc=loss_config.get('lambda_cc', 0.2),
-        temperature=loss_config.get('temperature', 0.1)
+        margin=loss_config.get('margin', 0.15)
     ).to(DEVICE)
     
     # 优化器 (与完整版完全一致)
@@ -231,7 +220,6 @@ def main():
     log_print(logger, f"      pos_weight: {pos_weight}")
     log_print(logger, f"      hidden_dim: {arch_config.get('hidden_dim', 32)}")
     log_print(logger, f"      encoder_blocks: {arch_config.get('encoder_blocks', 3)}")
-    log_print(logger, f"      PIRA 参数: beta={arch_config.get('beta', 1.0)}, L1={arch_config.get('lambda_1', 0.5)}, L2={arch_config.get('lambda_2', 1.0)}")
     log_print(logger, f"      数据划分: cascade_id 分组 (Train=全快照, Val/Test=仅最终快照)")
     log_print(logger, f"{'='*60}\n")
     
@@ -268,7 +256,7 @@ def main():
         # 打印进度
         recall_str = " | ".join([f"R@{k}: {val_metrics[f'recall@{k}']:.3f}" for k in RECALL_K_VALUES])
         log_print(logger, f"Epoch {epoch+1:03d} | Loss: {avg_loss:.4f} "
-              f"(BCE:{loss_comp['bce']:.3f}, Rank:{loss_comp['rank']:.3f}, CC:{loss_comp['cc_contrast']:.3f}) | "
+              f"(BCE:{loss_comp['bce']:.3f}, Rank:{loss_comp['rank']:.3f}) | "
               f"Val F1: {val_metrics['f1']:.4f} | {recall_str}")
     
     log_print(logger, f"[*] 最佳 Val F1: {best_val_f1:.4f} @ Epoch {best_epoch}")

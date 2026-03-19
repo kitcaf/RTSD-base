@@ -30,7 +30,7 @@ from data.sparsegraph import SparseGraph
 # ============================================================================
 
 # 数据集名称（修改此处来处理不同数据集：android, twitter, christianity, douban等）
-DATASET_NAME = 'douban'
+DATASET_NAME = 'android'
 
 # 路径配置
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))   # 脚本所在目录
@@ -49,7 +49,7 @@ RANDOM_SEED = 42   # 随机种子，保证可重复性
 # 级联处理参数
 # 中间快照的时间分位数（不含源点列0）；可自由配置
 # 最后一个分位数必须为1.0（100%最终状态），会被作为推理时的观测输入
-SNAPSHOT_QUANTILES = [0.25, 0.50, 0.75, 1.0]   # 可配置：例如改为 [0.5, 1.0] 只取两个快照
+SNAPSHOT_QUANTILES = [1.0]   # 可配置：例如改为 [0.5, 1.0] 只取两个快照
 NUM_TIMESTEPS = 1 + len(SNAPSHOT_QUANTILES)     # 自动计算：列0=源点，列1..T-1=各时间快照
 SOURCE_RATIO = 0.05  # 源节点时间比例（前5%时间内出现的节点作为源节点）
 
