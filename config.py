@@ -35,7 +35,6 @@ GFRR_ARCH_CONFIGS = {
         'hidden_dim': 64,          # 隐藏层维度
         'encoder_blocks': 2,       # Encoder GAT 块数量
         'dropout': 0.3,            # Dropout 比例
-        'k_hop': 2,                # K-hop 虚拟图聚合层数
         'lambda_1': 0.5,           # 物理距离衰减系数
         'lambda_2': 1.0,           # 大V防虹吸度数惩罚系数
         'beta': 1.0,               # PIRA 感染梯度引导系数
@@ -44,7 +43,6 @@ GFRR_ARCH_CONFIGS = {
         'hidden_dim': 32,
         'encoder_blocks': 2,       # 较少的块 (源点更显著)
         'dropout': 0.25,
-        'k_hop': 2,
         'lambda_1': 0.5,
         'lambda_2': 1.0,
         'beta': 1.0,
@@ -53,7 +51,6 @@ GFRR_ARCH_CONFIGS = {
         'hidden_dim': 64,
         'encoder_blocks': 2,
         'dropout': 0.3,
-        'k_hop': 2,
         'lambda_1': 1.0,           # douban 梯度平原更平，稍微加强距离衰减使得跨跳更理智
         'lambda_2': 1.0,
         'beta': 2.0,               # 强化梯度引导跨越平原
@@ -62,7 +59,6 @@ GFRR_ARCH_CONFIGS = {
         'hidden_dim': 64,
         'encoder_blocks': 3,
         'dropout': 0.3,
-        'k_hop': 2,
         'lambda_1': 0.5,
         'lambda_2': 2.0,           # twitter 度分布极不平衡，加强大V惩罚
         'beta': 1.0,

@@ -30,7 +30,7 @@ from data.sparsegraph import SparseGraph
 # ============================================================================
 
 # 数据集名称（修改此处来处理不同数据集：android, twitter, christianity, douban等）
-DATASET_NAME = 'android'
+DATASET_NAME = 'douban'
 
 # 路径配置
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))   # 脚本所在目录

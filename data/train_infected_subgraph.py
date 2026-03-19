@@ -198,7 +198,6 @@ def main():
     
     arch_config = get_gfrr_arch_config()
     loss_config = get_gfrr_loss_config()
-    k_hop = arch_config.get('k_hop', 2)
     
     # 预计算全局最短路径矩阵 (用于 AED 指标)
     log_print(logger, "[*] 预计算全局最短路径矩阵...")
@@ -244,12 +243,10 @@ def main():
         # 使用当前级联的子图去实例化 FeatureEngineer
         engineer = FeatureEngineerGFRR(adj_sub)
         
-        # 从全局距离矩阵提取子图节点间的最短路径（无需重复计算）
-        dist_matrix_sub = dist_matrix[np.ix_(cc_nodes, cc_nodes)]
-        
-        rows, cols = np.where((dist_matrix_sub > 0) & (dist_matrix_sub <= k_hop))
+        # 直接使用真实图边（不构建 K-hop 虚拟图）
+        rows, cols = np.where(adj_sub > 0)
         edge_index = torch.LongTensor(np.array([rows, cols]))
-        edge_dist = torch.FloatTensor(dist_matrix_sub[rows, cols])
+        edge_dist = torch.ones(edge_index.size(1), dtype=torch.float32)
         node_degrees = torch.FloatTensor(engineer.degrees)
         
         # 构造此子图的 y

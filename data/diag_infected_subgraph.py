@@ -1,5 +1,5 @@
 """
-感染子图连通性诊断脚本
+社交图上的感染子图连通性诊断脚本
 
 对每个级联，在社交图上提取感染节点的诱导子图，分析：
 1. 感染子图有多少个连通分量
@@ -14,6 +14,12 @@ import numpy as np
 import networkx as nx
 from collections import Counter, defaultdict
 from data_loader import load_raw_data
+
+
+def _fmt_table_value(value, is_percent=False):
+    if value is None:
+        return "N/A"
+    return f"{value:.1f}%" if is_percent else f"{value:.2f}"
 
 
 def analyze_infected_subgraph(dataset_name='douban_25c.SG', source_ratio=0.05, min_sources=2, max_cascades=None):
@@ -42,6 +48,7 @@ def analyze_infected_subgraph(dataset_name='douban_25c.SG', source_ratio=0.05, m
     orphan_cc_sizes_all = []         # 每个孤岛CC的大小（单独记录）
     source_cc_unified_sizes = []     # 源点100%聚集在同一CC时，该CC的大小
     unified_cascade_all_cc_sizes = [] # 源点100%聚集在同一CC的那些级联中，所有CC的大小
+    unified_source_cc_is_largest = [] # 源点100%聚集时，该源点CC是否为本级联最大CC
 
     cascades_to_process = min(M, max_cascades) if max_cascades else M
 
@@ -94,8 +101,11 @@ def analyze_infected_subgraph(dataset_name='douban_25c.SG', source_ratio=0.05, m
                 orphan_cc_sizes_all.append(len(cc))
 
         if source_cc_count == 1:
-            source_cc_unified_sizes.append(source_cc_sizes_local[0])
+            unified_size = source_cc_sizes_local[0]
+            source_cc_unified_sizes.append(unified_size)
             unified_cascade_all_cc_sizes.extend(cascade_cc_sizes)
+            max_cc_size = len(components[0])
+            unified_source_cc_is_largest.append(unified_size == max_cc_size)
 
         # 孤立源点: 源点在感染子图中度为0
         for s in source_nodes:
@@ -238,16 +248,81 @@ def analyze_infected_subgraph(dataset_name='douban_25c.SG', source_ratio=0.05, m
         print(f"  非连通级联平均源点数: {np.mean([stats_source_count[i] for i in disconnected_idx]):.2f}")
         print(f"  非连通级联平均CC数: {np.mean([stats_num_components[i] for i in disconnected_idx]):.2f}")
 
+    # 返回用于跨数据集汇总表的关键指标
+    connected_ratio = len(connected_idx) / total * 100 if total > 0 else None
+    mean_num_components = float(np.mean(stats_num_components)) if total > 0 else None
+    orphan_cascade_ratio = has_orphan / total * 100 if total > 0 else None
+    orphan_node_ratio_pct = float(np.mean(orphan_node_ratios) * 100) if orphan_node_ratios else None
+    unified_ratio = len(source_cc_unified_sizes) / total * 100 if total > 0 else None
+    unified_cc_avg_size = float(np.mean(source_cc_unified_sizes)) if source_cc_unified_sizes else None
+    unified_largest_ratio = (
+        float(np.mean(unified_source_cc_is_largest) * 100)
+        if unified_source_cc_is_largest else None
+    )
+    singleton_cc_ratio = (
+        float(np.mean(np.array(component_sizes_all) == 1) * 100)
+        if component_sizes_all else None
+    )
+    max_cc_avg_ratio = float(np.mean(stats_max_component_ratio) * 100) if total > 0 else None
+
+    return {
+        'connected_ratio': connected_ratio,
+        'mean_num_components': mean_num_components,
+        'orphan_cascade_ratio': orphan_cascade_ratio,
+        'orphan_node_ratio_pct': orphan_node_ratio_pct,
+        'unified_ratio': unified_ratio,
+        'unified_cc_avg_size': unified_cc_avg_size,
+        'unified_largest_ratio': unified_largest_ratio,
+        'singleton_cc_ratio': singleton_cc_ratio,
+        'max_cc_avg_ratio': max_cc_avg_ratio,
+    }
+
 
 if __name__ == "__main__":
     datasets = ['douban_25c.SG', 'android_25c.SG', 'christianity_25c.SG', 'twitter_25c.SG']
+    ds_display = {
+        'christianity_25c.SG': 'Christianity',
+        'douban_25c.SG': 'Douban',
+        'android_25c.SG': 'Android',
+        'twitter_25c.SG': 'Twitter',
+    }
+    table_order = ['christianity_25c.SG', 'douban_25c.SG', 'android_25c.SG', 'twitter_25c.SG']
+    summary_by_dataset = {}
 
     for ds in datasets:
         print("\n" + "▓" * 70)
         print(f"  数据集: {ds}")
         print("▓" * 70 + "\n")
         try:
-            analyze_infected_subgraph(ds)
+            summary_by_dataset[ds] = analyze_infected_subgraph(ds)
         except Exception as e:
             print(f"  错误: {e}")
         print()
+
+    print("\n" + "=" * 70)
+    print("# 感染子图连通性分析")
+    print("孤岛 = 无源点的连通块")
+    print("=" * 70)
+
+    header = ["指标", "Christianity", "Douban", "Android", "Twitter"]
+    print("\t".join(header))
+
+    metric_defs = [
+        ("感染子图完全连通", "connected_ratio", True),
+        ("平均连通分量数", "mean_num_components", False),
+        ("存在\"孤岛\"(无源点CC)的级联比例", "orphan_cascade_ratio", True),
+        ("孤岛节点占感染节点的比例", "orphan_node_ratio_pct", True),
+        ("源点 100% 聚集在同一 CC", "unified_ratio", True),
+        ("100%聚集所在这个CC的平均大小", "unified_cc_avg_size", False),
+        ("100%源点cc本级联最大CC的比例", "unified_largest_ratio", True),
+        ("大小=1 的孤立节点占比(所有CC)", "singleton_cc_ratio", True),
+        ("最大 CC 平均占比", "max_cc_avg_ratio", True),
+    ]
+
+    for label, key, is_percent in metric_defs:
+        row = [label]
+        for ds in table_order:
+            stats = summary_by_dataset.get(ds)
+            value = stats.get(key) if stats else None
+            row.append(_fmt_table_value(value, is_percent=is_percent))
+        print("\t".join(row))
