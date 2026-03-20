@@ -111,11 +111,41 @@ def compute_dynamic_pos_weight(dataset, scale_factor=1.0, min_weight=2.0, max_we
     return pos_weight, stats
 
 
+def apply_max_cc_hard_gate(logits, train_mask=None, max_cc_mask=None, gate_strength=12.0):
+    """
+    对最大CC外感染节点执行输出层硬门控（logit下压）。
+
+    Args:
+        logits: [N] 原始logits
+        train_mask: [N] 感染掩码，若提供则仅对感染节点施加门控
+        max_cc_mask: [N] 最大CC掩码（True表示在最大CC内）
+        gate_strength: logit下压值
+
+    Returns:
+        gated_logits: [N] 门控后的logits
+    """
+    if max_cc_mask is None:
+        return logits
+
+    max_cc_mask = max_cc_mask.bool().to(logits.device)
+    outside_mask = ~max_cc_mask
+    if train_mask is not None:
+        outside_mask = outside_mask & train_mask.bool().to(logits.device)
+
+    if outside_mask.sum() == 0:
+        return logits
+
+    gated_logits = logits.clone()
+    gated_logits[outside_mask] = gated_logits[outside_mask] - gate_strength
+    return gated_logits
+
+
 # ==========================================
 # GFRR 专用评估函数
 # ==========================================
 
-def find_optimal_threshold_gfrr(model, loader, device, dist_matrix=None):
+def find_optimal_threshold_gfrr(model, loader, device, dist_matrix=None,
+                                hard_gate_max_cc=False, gate_strength=12.0):
     """
     GFRR 模型的 Per-Cascade 动态阈值搜索
     
@@ -144,6 +174,14 @@ def find_optimal_threshold_gfrr(model, loader, device, dist_matrix=None):
                 logits, _ = output
             else:
                 logits = output
+
+            if hard_gate_max_cc and hasattr(data, 'max_cc_mask'):
+                logits = apply_max_cc_hard_gate(
+                    logits,
+                    train_mask=data.train_mask,
+                    max_cc_mask=data.max_cc_mask,
+                    gate_strength=gate_strength
+                )
             probs = torch.sigmoid(logits)
             
             mask = data.train_mask
@@ -179,7 +217,8 @@ def find_optimal_threshold_gfrr(model, loader, device, dist_matrix=None):
 def evaluate_gfrr(model, loader, device, threshold=0.5,
                   recall_k_values=None, dist_matrix=None,
                   use_mc_dropout=False, mc_dropout_samples=10,
-                  node_indices=None):
+                  node_indices=None,
+                  hard_gate_max_cc=False, gate_strength=12.0):
     """
     GFRR 模型评估函数
     
@@ -240,6 +279,14 @@ def evaluate_gfrr(model, loader, device, threshold=0.5,
                         logits_sum += curr_logits
                 
                 logits = logits_sum / mc_dropout_samples
+
+                if hard_gate_max_cc and hasattr(data, 'max_cc_mask'):
+                    logits = apply_max_cc_hard_gate(
+                        logits,
+                        train_mask=data.train_mask,
+                        max_cc_mask=data.max_cc_mask,
+                        gate_strength=gate_strength
+                    )
                 
                 # 2. 恢复 eval 模式 (关闭 Dropout)
                 model.eval()
@@ -250,6 +297,14 @@ def evaluate_gfrr(model, loader, device, threshold=0.5,
                     logits, _ = output
                 else:
                     logits = output
+
+                if hard_gate_max_cc and hasattr(data, 'max_cc_mask'):
+                    logits = apply_max_cc_hard_gate(
+                        logits,
+                        train_mask=data.train_mask,
+                        max_cc_mask=data.max_cc_mask,
+                        gate_strength=gate_strength
+                    )
 
             probs = torch.sigmoid(logits)
             

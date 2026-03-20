@@ -15,6 +15,7 @@ import torch
 import os
 from torch_geometric.data import Data
 from scipy.stats import rankdata
+from scipy.sparse.csgraph import connected_components
 
 
 class FeatureEngineerGFRR:
@@ -163,6 +164,40 @@ class FeatureEngineerGFRR:
     def get_num_features(self):
         """返回当前特征维度"""
         return 13 if self.ablation_feature_idx is not None else 14
+
+    def _extract_max_cc_mask(self, infected_indices):
+        """
+        提取感染诱导子图中的最大连通分量掩码。
+
+        Args:
+            infected_indices: 感染节点索引
+
+        Returns:
+            max_cc_mask: [N] bool 掩码（最大CC内为True）
+            max_cc_ratio: 最大CC占感染节点比例
+        """
+        max_cc_mask = np.zeros(self.num_nodes, dtype=bool)
+        if len(infected_indices) == 0:
+            return max_cc_mask, 0.0
+
+        if len(infected_indices) == 1:
+            max_cc_mask[infected_indices[0]] = True
+            return max_cc_mask, 1.0
+
+        subgraph = self.adj_matrix[np.ix_(infected_indices, infected_indices)]
+        n_cc, cc_labels_local = connected_components(subgraph, directed=False)
+
+        if n_cc <= 0:
+            return max_cc_mask, 0.0
+
+        cc_sizes = np.bincount(cc_labels_local)
+        max_cc_id = int(np.argmax(cc_sizes))
+        max_local_mask = (cc_labels_local == max_cc_id)
+        max_nodes = infected_indices[max_local_mask]
+
+        max_cc_mask[max_nodes] = True
+        max_cc_ratio = float(len(max_nodes) / max(len(infected_indices), 1))
+        return max_cc_mask, max_cc_ratio
     
     def _build_observed_features(self, infected_indices, source_indices):
         """
@@ -362,10 +397,12 @@ class FeatureEngineerGFRR:
                 - y: 标签 [N]
                 - train_mask: 感染节点掩码 [N]
                 - k_inf: 感染邻居数 [N]
+                - max_cc_mask: 最大CC掩码 [N]
+                - max_cc_ratio: 最大CC占感染节点比例
         """
         # 尝试加载缓存
         if cache_name is not None:
-            suffix = '_gfrr_multi' if use_gfrr else '_multi'
+            suffix = '_gfrr_multi_v2cc' if use_gfrr else '_multi_v2cc'
             cache_path = os.path.join(cache_dir, f'feature_{cache_name}{suffix}.pt')
             
             if os.path.exists(cache_path):
@@ -418,6 +455,7 @@ class FeatureEngineerGFRR:
 
                 # 构建观测态特征
                 x_observed, k_inf_tensor = self._build_observed_features(infected_indices, source_indices)
+                max_cc_mask_np, max_cc_ratio = self._extract_max_cc_mask(infected_indices)
 
                 # 感染掩码
                 train_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
@@ -429,7 +467,9 @@ class FeatureEngineerGFRR:
                     degrees=node_degrees,
                     y=torch.FloatTensor(y_np),
                     train_mask=train_mask,
-                    k_inf=k_inf_tensor
+                    k_inf=k_inf_tensor,
+                    max_cc_mask=torch.BoolTensor(max_cc_mask_np),
+                    max_cc_ratio=max_cc_ratio
                 )
 
                 # 标记 cascade_id 和 is_final，训练/推理分流用
@@ -448,7 +488,7 @@ class FeatureEngineerGFRR:
         
         # 保存缓存
         if cache_name is not None:
-            suffix = '_gfrr_multi' if use_gfrr else '_multi'
+            suffix = '_gfrr_multi_v2cc' if use_gfrr else '_multi_v2cc'
             cache_path = os.path.join(cache_dir, f'feature_{cache_name}{suffix}.pt')
             os.makedirs(cache_dir, exist_ok=True)
             try:

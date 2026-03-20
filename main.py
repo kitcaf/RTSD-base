@@ -17,6 +17,7 @@ from config import (
     TRAIN_RATIO, VAL_RATIO, RECALL_K_VALUES,
     LR, WEIGHT_DECAY, EPOCHS,
     USE_DYNAMIC_POS_WEIGHT, DEFAULT_POS_WEIGHT,
+    HARD_GATE_MAX_CC, LOGIT_GATE_VALUE,
     get_gfrr_arch_config, get_gfrr_loss_config
 )
 from data_loader import load_raw_data
@@ -28,6 +29,7 @@ from utils import (
     compute_dynamic_pos_weight,
     find_optimal_threshold_gfrr,
     evaluate_gfrr,
+    apply_max_cc_hard_gate,
     setup_training_logger,
     log_print
 )
@@ -49,6 +51,13 @@ def train_epoch(model, loader, criterion, optimizer, device):
         optimizer.zero_grad()
         
         logits = model(data)
+        if HARD_GATE_MAX_CC and hasattr(data, 'max_cc_mask'):
+            logits = apply_max_cc_hard_gate(
+                logits,
+                train_mask=data.train_mask,
+                max_cc_mask=data.max_cc_mask,
+                gate_strength=LOGIT_GATE_VALUE
+            )
         
         mask = data.train_mask
         if mask.sum() > 0:
@@ -89,7 +98,7 @@ def main():
     logger = setup_training_logger(log_name=log_file_name)
     
     log_print(logger, "=" * 60)
-    log_print(logger, "[*] 说明: 使用 GFRRLite (Encoder + ClassHead)")
+    log_print(logger, "[*] 说明: 使用 GFRRLite (Encoder + ClassHead - 最大CC硬约束)")
     log_print(logger, "=" * 60)
     log_print(logger, f"[*] 设备: {DEVICE}")
     
@@ -138,42 +147,6 @@ def main():
     val_loader = DataLoader(val_set, batch_size=1)
     test_loader = DataLoader(test_set, batch_size=1)
     
-    # 统计训练集和验证集的CC分布
-    log_print(logger, "[*] 统计CC分布...")
-    train_cc_stats = []
-    train_final_cc_stats = []
-    for data in train_set:
-        if hasattr(data, 'cc_labels'):
-            cc_labels = data.cc_labels.numpy()
-            infected_mask = data.train_mask.numpy()
-            unique_ccs = np.unique(cc_labels[infected_mask])
-            unique_ccs = unique_ccs[unique_ccs >= 0]
-            train_cc_stats.append(len(unique_ccs))
-            if data.is_final:
-                train_final_cc_stats.append(len(unique_ccs))
-    
-    val_cc_stats = []
-    for data in val_set:
-        if hasattr(data, 'cc_labels'):
-            cc_labels = data.cc_labels.numpy()
-            infected_mask = data.train_mask.numpy()
-            unique_ccs = np.unique(cc_labels[infected_mask])
-            unique_ccs = unique_ccs[unique_ccs >= 0]
-            val_cc_stats.append(len(unique_ccs))
-    
-    if train_cc_stats:
-        log_print(logger, f"    训练集(所有快照) - 平均CC数: {np.mean(train_cc_stats):.2f}, "
-                         f"单CC样本: {sum(1 for x in train_cc_stats if x == 1)}/{len(train_cc_stats)} "
-                         f"({100*sum(1 for x in train_cc_stats if x == 1)/len(train_cc_stats):.1f}%)")
-    if train_final_cc_stats:
-        log_print(logger, f"    训练集(最终快照) - 平均CC数: {np.mean(train_final_cc_stats):.2f}, "
-                         f"单CC样本: {sum(1 for x in train_final_cc_stats if x == 1)}/{len(train_final_cc_stats)} "
-                         f"({100*sum(1 for x in train_final_cc_stats if x == 1)/len(train_final_cc_stats):.1f}%)")
-    if val_cc_stats:
-        log_print(logger, f"    验证集(最终快照) - 平均CC数: {np.mean(val_cc_stats):.2f}, "
-                         f"单CC样本: {sum(1 for x in val_cc_stats if x == 1)}/{len(val_cc_stats)} "
-                         f"({100*sum(1 for x in val_cc_stats if x == 1)/len(val_cc_stats):.1f}%)")
-    
     # 确定 pos_weight (与完整版完全一致)
     if USE_DYNAMIC_POS_WEIGHT:
         pos_weight, _ = compute_dynamic_pos_weight(train_set)
@@ -220,6 +193,7 @@ def main():
     log_print(logger, f"      pos_weight: {pos_weight}")
     log_print(logger, f"      hidden_dim: {arch_config.get('hidden_dim', 32)}")
     log_print(logger, f"      encoder_blocks: {arch_config.get('encoder_blocks', 3)}")
+    log_print(logger, f"      Max-CC硬门控: {HARD_GATE_MAX_CC} (gate={LOGIT_GATE_VALUE})")
     log_print(logger, f"      数据划分: cascade_id 分组 (Train=全快照, Val/Test=仅最终快照)")
     log_print(logger, f"{'='*60}\n")
     
@@ -233,12 +207,21 @@ def main():
     for epoch in range(epochs):
         avg_loss, loss_comp = train_epoch(model, train_loader, criterion, optimizer, DEVICE)
         
-        best_th, _ = find_optimal_threshold_gfrr(model, val_loader, DEVICE,
-                                                  dist_matrix=dist_matrix)
+        best_th, _ = find_optimal_threshold_gfrr(
+            model,
+            val_loader,
+            DEVICE,
+            dist_matrix=dist_matrix,
+            hard_gate_max_cc=HARD_GATE_MAX_CC,
+            gate_strength=LOGIT_GATE_VALUE
+        )
         val_metrics = evaluate_gfrr(
             model, val_loader, DEVICE,
             threshold=best_th,
-            recall_k_values=RECALL_K_VALUES, dist_matrix=dist_matrix
+            recall_k_values=RECALL_K_VALUES,
+            dist_matrix=dist_matrix,
+            hard_gate_max_cc=HARD_GATE_MAX_CC,
+            gate_strength=LOGIT_GATE_VALUE
         )
         
         # 保存最佳模型
@@ -268,7 +251,10 @@ def main():
     test_metrics = evaluate_gfrr(
         model, test_loader, DEVICE,
         threshold=best_threshold,
-        recall_k_values=RECALL_K_VALUES, dist_matrix=dist_matrix
+        recall_k_values=RECALL_K_VALUES,
+        dist_matrix=dist_matrix,
+        hard_gate_max_cc=HARD_GATE_MAX_CC,
+        gate_strength=LOGIT_GATE_VALUE
     )
     
     log_print(logger, f"\n{'='*60}")

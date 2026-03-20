@@ -27,6 +27,10 @@ TEST_RATIO = 0.2
 # ===== 评估配置 =====
 RECALL_K_VALUES = [5, 15, 25]  # 计算 Recall@5, Recall@15, Recall@25
 
+# ===== 最大CC硬门控配置 =====
+HARD_GATE_MAX_CC = True   # 是否启用最大CC输出硬门控
+LOGIT_GATE_VALUE = 12.0   # 对最大CC外感染节点的logit下压值（越大越硬）
+
 
 # ===== GFRR (GAT-Flow Residual Refiner) 模型架构配置 =====
 # 各数据集的模型架构参数（独立于训练超参数）
