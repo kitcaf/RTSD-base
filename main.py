@@ -18,6 +18,8 @@ from config import (
     LR, WEIGHT_DECAY, EPOCHS,
     USE_DYNAMIC_POS_WEIGHT, DEFAULT_POS_WEIGHT,
     HARD_GATE_MAX_CC, LOGIT_GATE_VALUE,
+    USE_MAX_CC_POOL, MAX_CC_POOL_USE_MLP,
+    MAX_CC_POOL_ALPHA, MAX_CC_POOL_OUTSIDE_ALPHA,
     get_gfrr_arch_config, get_gfrr_loss_config
 )
 from data_loader import load_raw_data
@@ -98,7 +100,7 @@ def main():
     logger = setup_training_logger(log_name=log_file_name)
     
     log_print(logger, "=" * 60)
-    log_print(logger, "[*] 说明: 使用 GFRRLite (Encoder + ClassHead - 最大CC硬约束)")
+    log_print(logger, "[*] 说明: 使用 GFRRLite (Encoder + ClassHead - 最大CC硬约束 - 最大CC Pool)")
     log_print(logger, "=" * 60)
     log_print(logger, f"[*] 设备: {DEVICE}")
     
@@ -159,7 +161,11 @@ def main():
         num_features=14,
         hidden_dim=arch_config.get('hidden_dim', 32),
         encoder_blocks=arch_config.get('encoder_blocks', 3),
-        dropout=arch_config.get('dropout', 0.3)
+        dropout=arch_config.get('dropout', 0.3),
+        use_max_cc_pool=USE_MAX_CC_POOL,
+        max_cc_pool_use_mlp=MAX_CC_POOL_USE_MLP,
+        max_cc_pool_alpha=MAX_CC_POOL_ALPHA,
+        max_cc_pool_outside_alpha=MAX_CC_POOL_OUTSIDE_ALPHA
     ).to(DEVICE)
     
     # 打印模型参数
@@ -193,6 +199,7 @@ def main():
     log_print(logger, f"      pos_weight: {pos_weight}")
     log_print(logger, f"      hidden_dim: {arch_config.get('hidden_dim', 32)}")
     log_print(logger, f"      encoder_blocks: {arch_config.get('encoder_blocks', 3)}")
+    log_print(logger, f"      Max-CC Pool: {USE_MAX_CC_POOL} (mlp={MAX_CC_POOL_USE_MLP}, alpha={MAX_CC_POOL_ALPHA}, outside_alpha={MAX_CC_POOL_OUTSIDE_ALPHA})")
     log_print(logger, f"      Max-CC硬门控: {HARD_GATE_MAX_CC} (gate={LOGIT_GATE_VALUE})")
     log_print(logger, f"      数据划分: cascade_id 分组 (Train=全快照, Val/Test=仅最终快照)")
     log_print(logger, f"{'='*60}\n")

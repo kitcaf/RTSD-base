@@ -44,7 +44,11 @@ class GFRRLite(nn.Module):
         num_features: int = 14,
         hidden_dim: int = 32,
         encoder_blocks: int = 3,
-        dropout: float = 0.3
+        dropout: float = 0.3,
+        use_max_cc_pool: bool = True,
+        max_cc_pool_use_mlp: bool = True,
+        max_cc_pool_alpha: float = 0.2,
+        max_cc_pool_outside_alpha: float = 0.0
     ):
         super().__init__()
         
@@ -54,13 +58,18 @@ class GFRRLite(nn.Module):
             num_features=num_features,
             hidden_dim=hidden_dim,
             num_blocks=encoder_blocks,
-            dropout=dropout
+            dropout=dropout,
+            use_max_cc_pool=use_max_cc_pool,
+            max_cc_pool_use_mlp=max_cc_pool_use_mlp,
+            max_cc_pool_alpha=max_cc_pool_alpha,
+            max_cc_pool_outside_alpha=max_cc_pool_outside_alpha
         )
         
         self.class_head = ClassificationHead(hidden_dim, dropout)
     
     def forward(self, data):
-        z, gate_weights = self.encoder(data.x, data.edge_index)
+        max_cc_mask = data.max_cc_mask if hasattr(data, 'max_cc_mask') else None
+        z, gate_weights = self.encoder(data.x, data.edge_index, max_cc_mask=max_cc_mask)
         logits = self.class_head(z)
         return logits
     

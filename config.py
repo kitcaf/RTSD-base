@@ -31,6 +31,12 @@ RECALL_K_VALUES = [5, 15, 25]  # 计算 Recall@5, Recall@15, Recall@25
 HARD_GATE_MAX_CC = True   # 是否启用最大CC输出硬门控
 LOGIT_GATE_VALUE = 12.0   # 对最大CC外感染节点的logit下压值（越大越硬）
 
+# ===== 最大CC Pool + 回注配置 =====
+USE_MAX_CC_POOL = True            # 是否启用最大CC池化回注
+MAX_CC_POOL_USE_MLP = True        # 是否对 z_cc_max 使用小MLP
+MAX_CC_POOL_ALPHA = 0.20          # 最大CC内回注强度
+MAX_CC_POOL_OUTSIDE_ALPHA = 0.00  # 最大CC外回注强度（建议 0 或很小）
+
 
 # ===== GFRR (GAT-Flow Residual Refiner) 模型架构配置 =====
 # 各数据集的模型架构参数（独立于训练超参数）

@@ -250,7 +250,61 @@ class GatedFusion(nn.Module):
 
 
 # ==========================================
-# 5. GFRR Encoder 主模型
+# 5. 最大CC Pool + 回注
+# ==========================================
+class MaxCCPoolInjector(nn.Module):
+    """
+    仅在最大CC上做 pool 并回注到节点表示。
+
+    设计:
+        1. 取最大CC节点集合 Cmax
+        2. z_cc_max = mean(h[Cmax])
+        3. 可选 MLP 变换 z_cc_max
+        4. 最大CC内强回注, 外部可选弱回注
+    """
+    def __init__(self, hidden_dim: int, use_mlp: bool = True):
+        super().__init__()
+        self.use_mlp = use_mlp
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, hidden_dim)
+        ) if use_mlp else nn.Identity()
+
+    def forward(self, h, max_cc_mask, alpha: float = 0.2, outside_alpha: float = 0.0):
+        """
+        Args:
+            h: [N, C] 节点表示
+            max_cc_mask: [N] bool, 最大CC掩码
+            alpha: 最大CC内回注强度
+            outside_alpha: 最大CC外回注强度（默认0）
+
+        Returns:
+            h_out: [N, C] 回注后表示
+            z_cc_max: [C] 最大CC池化向量（用于可解释分析）
+        """
+        if max_cc_mask is None:
+            return h, None
+
+        mask = max_cc_mask.bool().to(h.device)
+        if mask.sum() == 0:
+            return h, None
+
+        z_cc_max = h[mask].mean(dim=0, keepdim=True)  # [1, C]
+        z_cc_max = self.mlp(z_cc_max)
+
+        h_out = h.clone()
+        h_out[mask] = h_out[mask] + alpha * z_cc_max
+        if outside_alpha > 0:
+            outside_mask = ~mask
+            if outside_mask.sum() > 0:
+                h_out[outside_mask] = h_out[outside_mask] + outside_alpha * z_cc_max
+
+        return h_out, z_cc_max.squeeze(0)
+
+
+# ==========================================
+# 6. GFRR Encoder 主模型
 # ==========================================
 class GFRREncoder(nn.Module):
     """
@@ -278,7 +332,11 @@ class GFRREncoder(nn.Module):
         num_features: int = 14,
         hidden_dim: int = 32,
         num_blocks: int = 3,
-        dropout: float = 0.3
+        dropout: float = 0.3,
+        use_max_cc_pool: bool = True,
+        max_cc_pool_use_mlp: bool = True,
+        max_cc_pool_alpha: float = 0.2,
+        max_cc_pool_outside_alpha: float = 0.0
     ):
         super().__init__()
         
@@ -308,8 +366,18 @@ class GFRREncoder(nn.Module):
         
         # 门控融合
         self.gated_fusion = GatedFusion(hidden_dim)
+
+        # 最大CC Pool + 回注
+        self.use_max_cc_pool = use_max_cc_pool
+        self.max_cc_pool_alpha = max_cc_pool_alpha
+        self.max_cc_pool_outside_alpha = max_cc_pool_outside_alpha
+        self.max_cc_pool = MaxCCPoolInjector(
+            hidden_dim=hidden_dim,
+            use_mlp=max_cc_pool_use_mlp
+        )
+        self.last_z_cc_max = None
     
-    def forward(self, x, edge_index):
+    def forward(self, x, edge_index, max_cc_mask=None):
         """
         前向传播
         
@@ -333,9 +401,21 @@ class GFRREncoder(nn.Module):
         # 门控融合 (融合第一层和最后一层)
         z, gate_weights = self.gated_fusion(layer_outputs[0], layer_outputs[-1])
 
+        # 最大CC Pool + 残差回注
+        if self.use_max_cc_pool:
+            z, z_cc_max = self.max_cc_pool(
+                z,
+                max_cc_mask=max_cc_mask,
+                alpha=self.max_cc_pool_alpha,
+                outside_alpha=self.max_cc_pool_outside_alpha
+            )
+            self.last_z_cc_max = z_cc_max
+        else:
+            self.last_z_cc_max = None
+
         return z, gate_weights
 
-    def encode(self, x, edge_index):
+    def encode(self, x, edge_index, max_cc_mask=None):
         """简化接口: 仅返回潜在表示"""
-        z, _ = self.forward(x, edge_index)
+        z, _ = self.forward(x, edge_index, max_cc_mask=max_cc_mask)
         return z
