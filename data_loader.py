@@ -4,6 +4,7 @@
 import pickle
 import os
 import numpy as np
+import scipy.sparse as sp
 
 class DataContainer:
     pass
@@ -56,8 +57,10 @@ def load_raw_data(file_path='android_25c.SG'):
     elif isinstance(data, (list, tuple)): 
         influ = data[1]
 
-    if hasattr(adj, 'toarray'): 
-        adj = adj.toarray()
+    if sp.issparse(adj):
+        adj = adj.tocsr()
+    else:
+        adj = np.asarray(adj)
     if isinstance(influ, list): 
         influ = np.array(influ)
     

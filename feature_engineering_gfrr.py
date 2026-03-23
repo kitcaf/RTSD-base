@@ -62,15 +62,26 @@ class FeatureEngineerGFRR:
             adj_matrix: 邻接矩阵 [N, N]
             ablation_feature_idx: 要消融的特征索引 (0-13), None表示不消融
         """
-        self.adj_matrix = adj_matrix
-        self.G = nx.from_numpy_array(adj_matrix)
-        self.num_nodes = adj_matrix.shape[0]
+        if sp.issparse(adj_matrix):
+            self.adj_matrix = adj_matrix.tocsr()
+        else:
+            self.adj_matrix = sp.csr_matrix(adj_matrix)
+
+        self.num_nodes = self.adj_matrix.shape[0]
         self.ablation_feature_idx = ablation_feature_idx
+
+        if hasattr(nx, 'from_scipy_sparse_array'):
+            self.G = nx.from_scipy_sparse_array(self.adj_matrix)
+        else:
+            self.G = nx.from_scipy_sparse_matrix(self.adj_matrix)
         
         # 预计算全图静态特征
-        self.degrees = np.array([d for n, d in self.G.degree()])
-        self.max_degree = max(self.degrees.max(), 1)
-        self.neighbors_list = [list(self.G.neighbors(i)) for i in range(self.num_nodes)]
+        self.degrees = np.asarray(self.adj_matrix.getnnz(axis=1)).astype(np.float32)
+        self.max_degree = max(float(self.degrees.max()) if self.degrees.size > 0 else 0.0, 1.0)
+        self.neighbors_list = [
+            self.adj_matrix.indices[self.adj_matrix.indptr[i]:self.adj_matrix.indptr[i + 1]].tolist()
+            for i in range(self.num_nodes)
+        ]
         
         # 全局度数排名
         self.global_rank = np.zeros(self.num_nodes)
@@ -165,6 +176,36 @@ class FeatureEngineerGFRR:
         """返回当前特征维度"""
         return 13 if self.ablation_feature_idx is not None else 14
 
+    def _extract_max_cc_nodes(self, infected_indices):
+        """
+        提取感染诱导子图中的最大连通分量节点集合。
+
+        Args:
+            infected_indices: 感染节点索引
+
+        Returns:
+            max_nodes: 最大CC中的全局节点索引
+            max_cc_ratio: 最大CC占感染节点比例
+        """
+        infected_indices = np.asarray(infected_indices, dtype=np.int64)
+        if len(infected_indices) == 0:
+            return np.array([], dtype=np.int64), 0.0
+
+        if len(infected_indices) == 1:
+            return infected_indices.copy(), 1.0
+
+        subgraph = self.adj_matrix[infected_indices][:, infected_indices]
+        n_cc, cc_labels_local = connected_components(subgraph, directed=False)
+
+        if n_cc <= 0:
+            return np.array([], dtype=np.int64), 0.0
+
+        cc_sizes = np.bincount(cc_labels_local)
+        max_cc_id = int(np.argmax(cc_sizes))
+        max_nodes = infected_indices[cc_labels_local == max_cc_id]
+        max_cc_ratio = float(len(max_nodes) / max(len(infected_indices), 1))
+        return max_nodes, max_cc_ratio
+
     def _extract_max_cc_mask(self, infected_indices):
         """
         提取感染诱导子图中的最大连通分量掩码。
@@ -177,28 +218,25 @@ class FeatureEngineerGFRR:
             max_cc_ratio: 最大CC占感染节点比例
         """
         max_cc_mask = np.zeros(self.num_nodes, dtype=bool)
-        if len(infected_indices) == 0:
-            return max_cc_mask, 0.0
-
-        if len(infected_indices) == 1:
-            max_cc_mask[infected_indices[0]] = True
-            return max_cc_mask, 1.0
-
-        subgraph = self.adj_matrix[np.ix_(infected_indices, infected_indices)]
-        n_cc, cc_labels_local = connected_components(subgraph, directed=False)
-
-        if n_cc <= 0:
-            return max_cc_mask, 0.0
-
-        cc_sizes = np.bincount(cc_labels_local)
-        max_cc_id = int(np.argmax(cc_sizes))
-        max_local_mask = (cc_labels_local == max_cc_id)
-        max_nodes = infected_indices[max_local_mask]
-
-        max_cc_mask[max_nodes] = True
-        max_cc_ratio = float(len(max_nodes) / max(len(infected_indices), 1))
+        max_nodes, max_cc_ratio = self._extract_max_cc_nodes(infected_indices)
+        if len(max_nodes) > 0:
+            max_cc_mask[max_nodes] = True
         return max_cc_mask, max_cc_ratio
-    
+
+    def _build_local_edge_index(self, node_indices):
+        """
+        构建局部诱导子图的 edge_index，并重映射为局部编号。
+        """
+        node_indices = np.asarray(node_indices, dtype=np.int64)
+        if len(node_indices) == 0:
+            return torch.empty((2, 0), dtype=torch.long)
+
+        sub_adj = self.adj_matrix[node_indices][:, node_indices].tocoo()
+        if sub_adj.nnz == 0:
+            return torch.empty((2, 0), dtype=torch.long)
+
+        return torch.LongTensor(np.vstack([sub_adj.row, sub_adj.col]))
+
     def _build_observed_features(self, infected_indices, source_indices):
         """
         构建观测态特征 (基于感染快照)
@@ -301,6 +339,110 @@ class FeatureEngineerGFRR:
 
         return x_observed, torch.FloatTensor(k_inf_all)
     
+    def _build_local_observed_features(self, active_nodes):
+        """
+        为最大CC输入图构建局部观测特征。
+
+        推荐策略:
+            - 静态拓扑特征仍基于全图预计算结果
+            - 传播相关特征仅基于当前最大CC诱导子图计算
+
+        Args:
+            active_nodes: 当前输入图中的全局节点索引
+
+        Returns:
+            x_observed: [M, 14] 局部观测特征
+            k_inf_tensor: [M] 最大CC子图内的感染邻居数
+        """
+        active_nodes = np.asarray(active_nodes, dtype=np.int64)
+        if len(active_nodes) == 0:
+            feat_dim = self.get_num_features()
+            return np.zeros((0, feat_dim), dtype=np.float32), torch.zeros(0, dtype=torch.float32)
+
+        active_set = set(int(x) for x in active_nodes.tolist())
+        local_index = {int(node_id): idx for idx, node_id in enumerate(active_nodes)}
+        ALPHA = 2.0
+
+        kcore_sub = self._compute_subgraph_kcore(active_nodes)
+        max_kcore = max(kcore_sub.values(), default=1) or 1
+        closeness, eccentricity, max_ecc = self._compute_subgraph_centralities(active_nodes)
+
+        k_inf_local = np.zeros(len(active_nodes), dtype=np.float32)
+        for local_idx, node_id in enumerate(active_nodes):
+            k_inf_local[local_idx] = sum(
+                1 for nb in self.neighbors_list[int(node_id)]
+                if nb in active_set
+            )
+        max_kinf = max(float(k_inf_local.max()) if len(k_inf_local) > 0 else 0.0, 1.0)
+
+        sub_rank = {}
+        sorted_idx = np.argsort(-k_inf_local)
+        for rank, idx in enumerate(sorted_idx):
+            sub_rank[int(active_nodes[idx])] = rank
+
+        x_observed = np.zeros((len(active_nodes), 14), dtype=np.float32)
+
+        for local_idx, node_id in enumerate(active_nodes):
+            node_id = int(node_id)
+            norm_deg = self.degree_percentile[node_id]
+            log_deg = np.log(self.degrees[node_id] + 1e-5) / 5.0
+
+            inf_count = float(k_inf_local[local_idx])
+            norm_inf_count = inf_count / self.max_degree
+
+            raw_i_score = inf_count + ALPHA * np.log(self.degrees[node_id] + 1e-5)
+            norm_i_score = raw_i_score / 50.0
+
+            kcore_val = kcore_sub.get(node_id, 0)
+            norm_kcore = kcore_val / max_kcore
+
+            nbs = self.neighbors_list[node_id]
+            active_nbs = [nb for nb in nbs if nb in active_set]
+
+            max_nb_kinf = max((k_inf_local[local_index[nb]] for nb in active_nbs), default=0.0)
+            norm_max_nb_kinf = np.log(max_nb_kinf + 1) / np.log(max_kinf + 1) if max_kinf > 0 else 0.0
+
+            mismatch = (sub_rank[node_id] - self.global_rank[node_id]) / self.num_nodes
+
+            if len(active_nbs) > 0:
+                my_kinf = k_inf_local[local_idx]
+                stronger_count = sum(
+                    1 for nb in active_nbs
+                    if k_inf_local[local_index[nb]] > my_kinf
+                )
+                kinf_rank_nb = stronger_count / (len(active_nbs) + 1e-6)
+                max_nb_kinf_val = max((k_inf_local[local_index[nb]] for nb in active_nbs), default=0.0)
+                is_peak = 1.0 if my_kinf >= max_nb_kinf_val else 0.0
+            else:
+                kinf_rank_nb = 0.0
+                is_peak = 1.0
+
+            sum_nb_kinf = sum(k_inf_local[local_index[nb]] for nb in active_nbs) if active_nbs else 0.0
+            bridge = (k_inf_local[local_idx] * self.degrees[node_id]) / (sum_nb_kinf + 1e-6)
+            norm_bridge = np.log(bridge + 1) / 10.0
+
+            sg_closeness = closeness.get(node_id, 0.0)
+            raw_ecc = eccentricity.get(node_id, 0.0)
+            sg_eccentricity = 1.0 - (raw_ecc / max_ecc) if max_ecc > 0 else 0.0
+
+            if len(active_nbs) > 0 and self.degrees[node_id] > 0:
+                smaller_count = sum(1 for nb in active_nbs if self.degrees[nb] < self.degrees[node_id])
+                outward_ratio = smaller_count / len(active_nbs)
+            else:
+                outward_ratio = 0.0
+
+            x_observed[local_idx] = [
+                1.0, norm_deg, norm_inf_count, log_deg,
+                norm_i_score, norm_kcore, norm_max_nb_kinf, mismatch,
+                kinf_rank_nb, is_peak, norm_bridge,
+                sg_closeness, sg_eccentricity, outward_ratio
+            ]
+
+        if self.ablation_feature_idx is not None:
+            x_observed = self._apply_ablation(x_observed)
+
+        return x_observed, torch.FloatTensor(k_inf_local)
+
     def _build_source_features(self, source_indices):
         """
         构建源点态特征 (初始状态)
@@ -379,37 +521,36 @@ class FeatureEngineerGFRR:
         
         return x_source
     
-    def generate_dataset(self, influ_list, cache_name=None, cache_dir='data', use_gfrr=True):
+    def generate_dataset(self, influ_list, cache_name=None, cache_dir='data', use_gfrr=True,
+                         use_max_cc_graph=False, final_only=False,
+                         require_source_in_graph=True):
         """
-        生成特征数据集
-        
+        生成特征数据集。
+
         Args:
             influ_list: 传播影响列表
             cache_name: 缓存文件名
             cache_dir: 缓存目录
             use_gfrr: 是否生成 GFRR 所需的 x_source 特征
-        
+            use_max_cc_graph: 是否直接使用最大CC诱导子图作为输入图
+            final_only: 是否只保留最终快照
+            require_source_in_graph: 若启用最大CC输入图, 是否要求源点全部保留在输入图内
+
         Returns:
-            dataset: Data 对象列表, 每个包含:
-                - x: 观测态特征 [N, 14]
-                - x_source: 源点态特征 [N, 14] (仅当 use_gfrr=True)
-                - edge_index: 边索引 [2, E]
-                - y: 标签 [N]
-                - train_mask: 感染节点掩码 [N]
-                - k_inf: 感染邻居数 [N]
-                - max_cc_mask: 最大CC掩码 [N]
-                - max_cc_ratio: 最大CC占感染节点比例
+            dataset: Data 对象列表
         """
-        # 尝试加载缓存
         if cache_name is not None:
-            suffix = '_gfrr_multi_v2cc' if use_gfrr else '_multi_v2cc'
+            if use_max_cc_graph:
+                graph_mode = 'final' if final_only else 'allsnap'
+                suffix = f"_gfrr_multi_v3maxccgraph_{graph_mode}" if use_gfrr else f"_multi_v3maxccgraph_{graph_mode}"
+            else:
+                suffix = '_gfrr_multi_v2cc' if use_gfrr else '_multi_v2cc'
             cache_path = os.path.join(cache_dir, f'feature_{cache_name}{suffix}.pt')
-            
+
             if os.path.exists(cache_path):
                 print(f"[*] 发现缓存: {cache_path}")
                 try:
                     cached_data = torch.load(cache_path)
-                    # 多快照模式下 Data 数量≥级联数，检查第一个 Data 是否带有 cascade_id
                     has_multi = len(cached_data) > 0 and hasattr(cached_data[0], 'cascade_id')
                     if has_multi:
                         print(f"[*] 从缓存加载 {len(cached_data)} 个样本（多快照模式）")
@@ -417,78 +558,111 @@ class FeatureEngineerGFRR:
                     print(f"[!] 缓存格式不匹配（旧版单快照）, 重新计算...")
                 except Exception as e:
                     print(f"[!] 缓存加载失败: {e}, 重新计算...")
-        
-        print(f"[*] 构建 GFRR 特征数据集 (use_gfrr={use_gfrr}, 多快照模式)...")
+
+        print(
+            f"[*] 构建 GFRR 特征数据集 (use_gfrr={use_gfrr}, "
+            f"use_max_cc_graph={use_max_cc_graph}, final_only={final_only})..."
+        )
         dataset = []
-        
-        # 使用原始邻接矩阵构建边索引（全图）
+        skipped_missing_sources = 0
+
         adj_coo = sp.coo_matrix(self.adj_matrix)
-        edge_index = torch.LongTensor(np.array([adj_coo.row, adj_coo.col]))
-        node_degrees = torch.FloatTensor(self.degrees)
-        
+        full_edge_index = torch.LongTensor(np.array([adj_coo.row, adj_coo.col]))
+        full_node_degrees = torch.FloatTensor(self.degrees)
+
         for cascade_idx, mat in enumerate(influ_list):
             source_vec = mat[:, 0]
-            n_snapshot_cols = mat.shape[1] - 1  # 除列0之外共有 T-1 个快照列
+            n_snapshot_cols = mat.shape[1] - 1
 
             source_indices = np.where(source_vec == 1)[0]
             if len(source_indices) == 0:
                 continue
 
-            # 标签（所有快照共享同一个标签）
-            y_np = np.zeros(self.num_nodes, dtype=np.float32)
-            y_np[source_indices] = 1.0
+            y_np_full = np.zeros(self.num_nodes, dtype=np.float32)
+            y_np_full[source_indices] = 1.0
 
-            # GFRR 模式：预先计算源点态特征（所有快照共享）
-            x_source = None
+            x_source_full = None
             if use_gfrr:
-                x_source = self._build_source_features(source_indices)
+                x_source_full = self._build_source_features(source_indices)
 
-            for t_idx in range(n_snapshot_cols):
+            snapshot_range = [n_snapshot_cols - 1] if final_only and n_snapshot_cols > 0 else range(n_snapshot_cols)
+
+            for t_idx in snapshot_range:
                 infected_vec = mat[:, t_idx + 1]
                 infected_indices = np.where(infected_vec == 1)[0]
 
                 if len(infected_indices) == 0:
                     continue
 
-                # 是否为最终快照（推理时使用）
                 is_final = (t_idx == n_snapshot_cols - 1)
 
-                # 构建观测态特征
-                x_observed, k_inf_tensor = self._build_observed_features(infected_indices, source_indices)
-                max_cc_mask_np, max_cc_ratio = self._extract_max_cc_mask(infected_indices)
+                if use_max_cc_graph:
+                    graph_nodes, max_cc_ratio = self._extract_max_cc_nodes(infected_indices)
+                    if len(graph_nodes) == 0:
+                        continue
 
-                # 感染掩码
-                train_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
-                train_mask[infected_indices] = True
+                    if require_source_in_graph and not np.isin(source_indices, graph_nodes).all():
+                        skipped_missing_sources += 1
+                        continue
 
-                data = Data(
-                    x=torch.FloatTensor(x_observed),
-                    edge_index=edge_index,
-                    degrees=node_degrees,
-                    y=torch.FloatTensor(y_np),
-                    train_mask=train_mask,
-                    k_inf=k_inf_tensor,
-                    max_cc_mask=torch.BoolTensor(max_cc_mask_np),
-                    max_cc_ratio=max_cc_ratio
-                )
+                    x_observed, k_inf_tensor = self._build_local_observed_features(graph_nodes)
+                    source_mask_local = np.isin(graph_nodes, source_indices).astype(np.float32)
 
-                # 标记 cascade_id 和 is_final，训练/推理分流用
+                    data = Data(
+                        x=torch.FloatTensor(x_observed),
+                        edge_index=self._build_local_edge_index(graph_nodes),
+                        degrees=torch.FloatTensor(self.degrees[graph_nodes]),
+                        y=torch.FloatTensor(source_mask_local),
+                        train_mask=torch.ones(len(graph_nodes), dtype=torch.bool),
+                        k_inf=k_inf_tensor,
+                        max_cc_mask=torch.ones(len(graph_nodes), dtype=torch.bool),
+                        max_cc_ratio=max_cc_ratio,
+                        orig_node_ids=torch.LongTensor(graph_nodes),
+                        num_infected_full=int(len(infected_indices))
+                    )
+
+                    if use_gfrr:
+                        data.x_source = torch.FloatTensor(x_source_full[graph_nodes])
+                else:
+                    x_observed, k_inf_tensor = self._build_observed_features(infected_indices, source_indices)
+                    max_cc_mask_np, max_cc_ratio = self._extract_max_cc_mask(infected_indices)
+
+                    train_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
+                    train_mask[infected_indices] = True
+
+                    data = Data(
+                        x=torch.FloatTensor(x_observed),
+                        edge_index=full_edge_index,
+                        degrees=full_node_degrees,
+                        y=torch.FloatTensor(y_np_full),
+                        train_mask=train_mask,
+                        k_inf=k_inf_tensor,
+                        max_cc_mask=torch.BoolTensor(max_cc_mask_np),
+                        max_cc_ratio=max_cc_ratio
+                    )
+
+                    if use_gfrr:
+                        data.x_source = torch.FloatTensor(x_source_full)
+
                 data.cascade_id = cascade_idx
                 data.is_final = is_final
-
-                if use_gfrr:
-                    data.x_source = torch.FloatTensor(x_source)
-
                 dataset.append(data)
-            
+
             if (cascade_idx + 1) % 100 == 0:
                 print(f"    已处理 {cascade_idx + 1}/{len(influ_list)} 个级联...")
-        
+
         print(f"[*] 数据集构建完成, 共 {len(dataset)} 个样本（来自 {len(influ_list)} 个级联）")
-        
-        # 保存缓存
+        if use_max_cc_graph:
+            print(
+                f"[*] 最大CC输入图模式: 跳过 {skipped_missing_sources} 个源点未被最大CC完整覆盖的样本"
+            )
+
         if cache_name is not None:
-            suffix = '_gfrr_multi_v2cc' if use_gfrr else '_multi_v2cc'
+            if use_max_cc_graph:
+                graph_mode = 'final' if final_only else 'allsnap'
+                suffix = f"_gfrr_multi_v3maxccgraph_{graph_mode}" if use_gfrr else f"_multi_v3maxccgraph_{graph_mode}"
+            else:
+                suffix = '_gfrr_multi_v2cc' if use_gfrr else '_multi_v2cc'
             cache_path = os.path.join(cache_dir, f'feature_{cache_name}{suffix}.pt')
             os.makedirs(cache_dir, exist_ok=True)
             try:
@@ -496,5 +670,5 @@ class FeatureEngineerGFRR:
                 print(f"[*] 已缓存到: {cache_path}")
             except Exception as e:
                 print(f"[!] 缓存保存失败: {e}")
-        
+
         return dataset

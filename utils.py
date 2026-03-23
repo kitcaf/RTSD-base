@@ -314,9 +314,15 @@ def evaluate_gfrr(model, loader, device, threshold=0.5,
             
             y_true = data.y[mask].cpu().numpy()
             y_scores = probs[mask].cpu().numpy()
-            
+
             # 全局索引 (用于 AED)
-            infected_indices = torch.where(mask)[0].cpu().numpy()
+            if hasattr(data, 'orig_node_ids'):
+                local_mask = mask.cpu().numpy()
+                infected_indices = data.orig_node_ids.cpu().numpy()[local_mask]
+            elif node_indices is not None:
+                infected_indices = np.asarray(node_indices)
+            else:
+                infected_indices = torch.where(mask)[0].cpu().numpy()
             
             # AUC
             try:

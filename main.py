@@ -17,6 +17,7 @@ from config import (
     TRAIN_RATIO, VAL_RATIO, RECALL_K_VALUES,
     LR, WEIGHT_DECAY, EPOCHS,
     USE_DYNAMIC_POS_WEIGHT, DEFAULT_POS_WEIGHT,
+    USE_MAX_CC_GRAPH, MAX_CC_GRAPH_FINAL_ONLY, SKIP_SAMPLES_WITH_MISSING_SOURCES,
     HARD_GATE_MAX_CC, LOGIT_GATE_VALUE,
     USE_MAX_CC_POOL, MAX_CC_POOL_USE_MLP,
     MAX_CC_POOL_ALPHA, MAX_CC_POOL_OUTSIDE_ALPHA,
@@ -99,8 +100,16 @@ def main():
     log_file_name = f"{data_name}_log.txt"
     logger = setup_training_logger(log_name=log_file_name)
     
+    input_graph_desc = "最大CC诱导子图" if USE_MAX_CC_GRAPH else "全图"
+    cc_modules = []
+    if HARD_GATE_MAX_CC:
+        cc_modules.append("最大CC硬约束")
+    if USE_MAX_CC_POOL:
+        cc_modules.append("最大CC Pool")
+    cc_module_desc = " + ".join(cc_modules) if cc_modules else "无额外最大CC模块"
+
     log_print(logger, "=" * 60)
-    log_print(logger, "[*] 说明: 使用 GFRRLite (Encoder + ClassHead - 最大CC硬约束 - 最大CC Pool)")
+    log_print(logger, f"[*] 说明: 使用 GFRRLite (Encoder + ClassHead | 输入图={input_graph_desc} | {cc_module_desc})")
     log_print(logger, "=" * 60)
     log_print(logger, f"[*] 设备: {DEVICE}")
     
@@ -116,9 +125,12 @@ def main():
     # 特征工程
     engineer = FeatureEngineerGFRR(adj)
     dataset = engineer.generate_dataset(
-        influ, 
-        cache_name=data_name, 
-        use_gfrr=False
+        influ,
+        cache_name=data_name,
+        use_gfrr=False,
+        use_max_cc_graph=USE_MAX_CC_GRAPH,
+        final_only=MAX_CC_GRAPH_FINAL_ONLY,
+        require_source_in_graph=SKIP_SAMPLES_WITH_MISSING_SOURCES
     )
     
     # 预计算最短路径 (与完整版完全一致)
@@ -126,9 +138,8 @@ def main():
     dist_matrix = precompute_shortest_paths(adj)
     
     # 数据划分 ── 按 cascade_id 分组，保证同一级联的不同快照落在同一分区
-    # · train_set : 包含训练分区所有快照（含中间快照，扩充训练数据）
-    # · val_set   : 只保留 is_final=True 快照（推理语义，与测试一致）
-    # · test_set  : 只保留 is_final=True 快照
+    # · 当 MAX_CC_GRAPH_FINAL_ONLY=True 时，Train/Val/Test 都只包含最终快照
+    # · 否则 Train 保留训练分区全部快照，Val/Test 仍只保留最终快照
     all_cascade_ids = sorted(set(d.cascade_id for d in dataset))
     random.shuffle(all_cascade_ids)
     n_cas = len(all_cascade_ids)
@@ -141,7 +152,8 @@ def main():
     val_set   = [d for d in dataset if d.cascade_id in val_cas_ids   and d.is_final]
     test_set  = [d for d in dataset if d.cascade_id in test_cas_ids  and d.is_final]
 
-    log_print(logger, f"[*] 数据划分: Train={len(train_set)} (含所有快照), Val={len(val_set)} (仅最终快照), Test={len(test_set)} (仅最终快照)")
+    train_snapshot_desc = "仅最终快照" if MAX_CC_GRAPH_FINAL_ONLY else "含所有快照"
+    log_print(logger, f"[*] 数据划分: Train={len(train_set)} ({train_snapshot_desc}), Val={len(val_set)} (仅最终快照), Test={len(test_set)} (仅最终快照)")
     log_print(logger, f"    梯度级联数: Train={len(train_cas_ids)}, Val={len(val_cas_ids)}, Test={len(test_cas_ids)}")
 
     
@@ -201,14 +213,16 @@ def main():
     log_print(logger, f"      encoder_blocks: {arch_config.get('encoder_blocks', 3)}")
     log_print(logger, f"      Max-CC Pool: {USE_MAX_CC_POOL} (mlp={MAX_CC_POOL_USE_MLP}, alpha={MAX_CC_POOL_ALPHA}, outside_alpha={MAX_CC_POOL_OUTSIDE_ALPHA})")
     log_print(logger, f"      Max-CC硬门控: {HARD_GATE_MAX_CC} (gate={LOGIT_GATE_VALUE})")
-    log_print(logger, f"      数据划分: cascade_id 分组 (Train=全快照, Val/Test=仅最终快照)")
+    log_print(logger, f"      数据划分: cascade_id 分组 (Train={train_snapshot_desc}, Val/Test=仅最终快照)")
+    log_print(logger, f"      输入图模式: {input_graph_desc} (final_only={MAX_CC_GRAPH_FINAL_ONLY}, skip_missing_sources={SKIP_SAMPLES_WITH_MISSING_SOURCES})")
     log_print(logger, f"{'='*60}\n")
     
     # 训练循环
     best_val_f1 = 0
     best_threshold = 0.5
     best_epoch = 0
-    save_path = f'checkpoints_gfrr/gfrr_lite_{data_name}_ablation_noflow_best.pt'
+    save_tag = 'maxccgraph' if USE_MAX_CC_GRAPH else 'ablation_noflow'
+    save_path = f'checkpoints_gfrr/gfrr_lite_{data_name}_{save_tag}_best.pt'
     os.makedirs('checkpoints_gfrr', exist_ok=True)
     
     for epoch in range(epochs):

@@ -27,12 +27,20 @@ TEST_RATIO = 0.2
 # ===== 评估配置 =====
 RECALL_K_VALUES = [5, 15, 25]  # 计算 Recall@5, Recall@15, Recall@25
 
+# ===== 最大CC输入图配置 =====
+# 说明:
+#   - USE_MAX_CC_GRAPH=True 时, 每个样本直接使用感染子图的最大CC诱导子图作为 GNN 输入
+#   - 当前“源点100%落在最大CC”的结论来自最终快照, 因此默认只保留最终快照
+USE_MAX_CC_GRAPH = True
+MAX_CC_GRAPH_FINAL_ONLY = True
+SKIP_SAMPLES_WITH_MISSING_SOURCES = True
+
 # ===== 最大CC硬门控配置 =====
-HARD_GATE_MAX_CC = True   # 是否启用最大CC输出硬门控
+HARD_GATE_MAX_CC = False if USE_MAX_CC_GRAPH else True
 LOGIT_GATE_VALUE = 12.0   # 对最大CC外感染节点的logit下压值（越大越硬）
 
 # ===== 最大CC Pool + 回注配置 =====
-USE_MAX_CC_POOL = True            # 是否启用最大CC池化回注
+USE_MAX_CC_POOL = False if USE_MAX_CC_GRAPH else True
 MAX_CC_POOL_USE_MLP = True        # 是否对 z_cc_max 使用小MLP
 MAX_CC_POOL_ALPHA = 0.20          # 最大CC内回注强度
 MAX_CC_POOL_OUTSIDE_ALPHA = 0.00  # 最大CC外回注强度（建议 0 或很小）
@@ -105,3 +113,4 @@ def get_gfrr_arch_config():
 def get_gfrr_loss_config():
     """获取当前数据集的 GFRR 损失函数配置"""
     return GFRR_LOSS_CONFIGS[DATASET_NAMES[DATASET_IDX]]
+
