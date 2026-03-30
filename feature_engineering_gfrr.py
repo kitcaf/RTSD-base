@@ -3,11 +3,12 @@ GFRR 特征工程模块
 生成观测态特征 (x_observed) 和 源点态特征 (x_source)
 
 设计原则:
-    - x_observed: 基于完整感染快照计算的 14 维特征
-    - x_source: 基于源点初始状态的 14 维特征
+    - x_observed: 基于完整感染快照计算的增强特征
+    - x_source: 基于源点初始状态的增强特征
         - 静态特征保持不变: is_source, norm_deg, log_deg
         - 传播相关特征设为初始值 (0 或合理默认值)
 """
+from collections import deque
 import numpy as np
 import scipy.sparse as sp
 import networkx as nx
@@ -23,10 +24,10 @@ class FeatureEngineerGFRR:
     GFRR 特征工程器
     
     生成两套特征:
-        1. x_observed [N, 14]: 观测态特征 (基于感染快照)
-        2. x_source [N, 14]: 源点态特征 (初始状态)
+        1. x_observed [N, D]: 观测态特征 (基于感染快照)
+        2. x_source [N, D]: 源点态特征 (初始状态)
     
-    特征维度说明:
+    基础特征维度说明:
         [0]  state_flag: 状态标志 (observed: is_infected, source: is_source)
         [1]  norm_deg: 归一化全局度 (静态, 共享)
         [2]  norm_inf_count: 归一化感染邻居数
@@ -41,18 +42,44 @@ class FeatureEngineerGFRR:
         [11] subgraph_closeness: 子图接近中心性
         [12] subgraph_eccentricity: 子图偏心率
         [13] outward_ratio: 传播方向比
+
+    最大CC内部相对特征:
+        [14] closeness_percentile_in_maxcc
+        [15] eccentricity_percentile_in_maxcc
+        [16] degree_percentile_in_maxcc
+        [17] kinf_percentile_in_maxcc
+        [18] degree_rank_minus_kinf_rank
+        [19] closeness_rank_minus_kinf_rank
+        [20] kinf_vs_best_neighbor_ratio
+        [21] distance_to_boundary_of_maxcc
     """
     
     # 静态特征索引 (不依赖传播状态)
     STATIC_FEATURE_INDICES = [1, 3]  # norm_deg, log_deg
     
     # 特征名称映射
-    FEATURE_NAMES = [
+    BASE_FEATURE_NAMES = [
         'state_flag', 'norm_deg', 'norm_inf_count', 'log_deg',
         'i_score', 'kcore_sub', 'max_neighbor_kinf', 'mismatch_ratio',
         'kinf_rank_in_neighborhood', 'is_local_kinf_peak', 'bridge_score',
         'subgraph_closeness', 'subgraph_eccentricity', 'outward_ratio'
     ]
+
+    MAX_CC_RELATIVE_FEATURE_NAMES = [
+        'closeness_percentile_in_maxcc',
+        'eccentricity_percentile_in_maxcc',
+        'degree_percentile_in_maxcc',
+        'kinf_percentile_in_maxcc',
+        'degree_rank_minus_kinf_rank',
+        'closeness_rank_minus_kinf_rank',
+        'kinf_vs_best_neighbor_ratio',
+        'distance_to_boundary_of_maxcc'
+    ]
+
+    FEATURE_NAMES = BASE_FEATURE_NAMES + MAX_CC_RELATIVE_FEATURE_NAMES
+    FEATURE_INDEX = {name: idx for idx, name in enumerate(FEATURE_NAMES)}
+    BASE_FEATURE_DIM = len(BASE_FEATURE_NAMES)
+    TOTAL_FEATURE_DIM = len(FEATURE_NAMES)
     
     def __init__(self, adj_matrix, ablation_feature_idx=None):
         """
@@ -60,7 +87,7 @@ class FeatureEngineerGFRR:
         
         Args:
             adj_matrix: 邻接矩阵 [N, N]
-            ablation_feature_idx: 要消融的特征索引 (0-13), None表示不消融
+            ablation_feature_idx: 要消融的特征索引, None表示不消融
         """
         if sp.issparse(adj_matrix):
             self.adj_matrix = adj_matrix.tocsr()
@@ -160,7 +187,7 @@ class FeatureEngineerGFRR:
         应用特征消融：移除指定特征列
         
         Args:
-            features: [N, 14] 特征矩阵
+            features: [N, D] 特征矩阵
         
         Returns:
             ablated_features: [N, 13] 消融后的特征矩阵
@@ -174,7 +201,7 @@ class FeatureEngineerGFRR:
     
     def get_num_features(self):
         """返回当前特征维度"""
-        return 13 if self.ablation_feature_idx is not None else 14
+        return self.TOTAL_FEATURE_DIM - (1 if self.ablation_feature_idx is not None else 0)
 
     def _extract_max_cc_nodes(self, infected_indices):
         """
@@ -223,6 +250,120 @@ class FeatureEngineerGFRR:
             max_cc_mask[max_nodes] = True
         return max_cc_mask, max_cc_ratio
 
+    def _compute_descending_percentiles(self, values):
+        """将数值映射为 [0, 1] 百分位，值越大百分位越高。"""
+        values = np.asarray(values, dtype=np.float32)
+        if values.size == 0:
+            return np.zeros(0, dtype=np.float32)
+        if values.size == 1:
+            return np.ones(1, dtype=np.float32)
+        ranks = rankdata(-values, method='average')
+        return (1.0 - (ranks - 1.0) / max(values.size - 1, 1)).astype(np.float32)
+
+    def _compute_zero_based_ranks(self, values):
+        """计算降序 zero-based rank，排名越小表示越靠前。"""
+        values = np.asarray(values, dtype=np.float32)
+        if values.size == 0:
+            return np.zeros(0, dtype=np.float32)
+        return (rankdata(-values, method='average') - 1.0).astype(np.float32)
+
+    def _compute_boundary_depth_map(self, max_cc_nodes, infected_set):
+        """
+        计算最大CC内节点到感染边界的距离（归一化后越大表示越靠内核）。
+
+        边界节点定义为: 至少有一个邻居不在当前感染集合中的最大CC节点。
+        """
+        max_cc_nodes = np.asarray(max_cc_nodes, dtype=np.int64)
+        if len(max_cc_nodes) == 0:
+            return {}
+
+        max_cc_set = set(int(node) for node in max_cc_nodes.tolist())
+        boundary_nodes = [
+            int(node) for node in max_cc_nodes
+            if any(nb not in infected_set for nb in self.neighbors_list[int(node)])
+        ]
+
+        if not boundary_nodes:
+            boundary_nodes = [int(node) for node in max_cc_nodes]
+
+        dist_map = {int(node): np.inf for node in max_cc_nodes}
+        queue = deque(boundary_nodes)
+        for node in boundary_nodes:
+            dist_map[node] = 0
+
+        while queue:
+            node = queue.popleft()
+            base_dist = dist_map[node]
+            for nb in self.neighbors_list[node]:
+                if nb not in max_cc_set:
+                    continue
+                if dist_map[nb] > base_dist + 1:
+                    dist_map[nb] = base_dist + 1
+                    queue.append(nb)
+
+        finite_distances = [dist for dist in dist_map.values() if np.isfinite(dist)]
+        max_dist = max(finite_distances, default=0.0)
+        denom = max(float(max_dist), 1.0)
+
+        return {
+            node: float(dist / denom) if np.isfinite(dist) else 0.0
+            for node, dist in dist_map.items()
+        }
+
+    def _compute_max_cc_relative_feature_map(
+        self,
+        max_cc_nodes,
+        infected_set,
+        k_inf_lookup,
+        closeness_lookup,
+        eccentricity_lookup
+    ):
+        """构建最大CC内部相对特征映射。"""
+        max_cc_nodes = np.asarray(max_cc_nodes, dtype=np.int64)
+        if len(max_cc_nodes) == 0:
+            return {}
+
+        max_cc_set = set(int(node) for node in max_cc_nodes.tolist())
+        degree_values = self.degrees[max_cc_nodes].astype(np.float32)
+        kinf_values = np.array([float(k_inf_lookup.get(int(node), 0.0)) for node in max_cc_nodes], dtype=np.float32)
+        closeness_values = np.array([float(closeness_lookup.get(int(node), 0.0)) for node in max_cc_nodes], dtype=np.float32)
+        eccentricity_values = np.array([float(eccentricity_lookup.get(int(node), 0.0)) for node in max_cc_nodes], dtype=np.float32)
+
+        closeness_pct = self._compute_descending_percentiles(closeness_values)
+        eccentricity_pct = self._compute_descending_percentiles(eccentricity_values)
+        degree_pct = self._compute_descending_percentiles(degree_values)
+        kinf_pct = self._compute_descending_percentiles(kinf_values)
+
+        degree_rank = self._compute_zero_based_ranks(degree_values)
+        kinf_rank = self._compute_zero_based_ranks(kinf_values)
+        closeness_rank = self._compute_zero_based_ranks(closeness_values)
+        rank_denom = max(len(max_cc_nodes) - 1, 1)
+
+        boundary_depth_map = self._compute_boundary_depth_map(max_cc_nodes, infected_set)
+
+        feature_map = {}
+        for idx, node in enumerate(max_cc_nodes):
+            node = int(node)
+            max_cc_neighbors = [nb for nb in self.neighbors_list[node] if nb in max_cc_set]
+            max_nb_kinf = max((float(k_inf_lookup.get(nb, 0.0)) for nb in max_cc_neighbors), default=0.0)
+            if max_nb_kinf > 0:
+                kinf_neighbor_ratio = float(kinf_values[idx] / max_nb_kinf)
+            else:
+                kinf_neighbor_ratio = 0.0
+
+            feature_map[node] = np.array([
+                closeness_pct[idx],
+                eccentricity_pct[idx],
+                degree_pct[idx],
+                kinf_pct[idx],
+                (degree_rank[idx] - kinf_rank[idx]) / rank_denom,
+                (closeness_rank[idx] - kinf_rank[idx]) / rank_denom,
+                kinf_neighbor_ratio,
+                float(boundary_depth_map.get(node, 0.0))
+            ], dtype=np.float32)
+
+        return feature_map
+
     def _build_local_edge_index(self, node_indices):
         """
         构建局部诱导子图的 edge_index，并重映射为局部编号。
@@ -246,7 +387,7 @@ class FeatureEngineerGFRR:
             source_indices: 源点索引
         
         Returns:
-            x_observed: [N, 14] 观测态特征
+            x_observed: [N, D] 观测态特征
             k_inf_tensor: [N] 感染邻居数
         """
         infected_set = set(infected_indices)
@@ -264,6 +405,15 @@ class FeatureEngineerGFRR:
         for i in range(self.num_nodes):
             k_inf_all[i] = sum(1 for nb in self.neighbors_list[i] if nb in infected_set)
         max_kinf = max(k_inf_all.max(), 1)
+
+        max_cc_nodes, _ = self._extract_max_cc_nodes(infected_indices)
+        max_cc_relative_map = self._compute_max_cc_relative_feature_map(
+            max_cc_nodes=max_cc_nodes,
+            infected_set=infected_set,
+            k_inf_lookup={int(node): float(k_inf_all[int(node)]) for node in max_cc_nodes},
+            closeness_lookup=closeness,
+            eccentricity_lookup={int(node): float(1.0 - (eccentricity.get(int(node), 0.0) / max_ecc)) for node in max_cc_nodes}
+        )
         
         # 子图内 k_inf 排名
         sub_rank = np.zeros(self.num_nodes)
@@ -273,7 +423,7 @@ class FeatureEngineerGFRR:
             sub_rank[infected_indices[idx]] = rank
         
         # 构建特征矩阵
-        x_observed = np.zeros((self.num_nodes, 14), dtype=np.float32)
+        x_observed = np.zeros((self.num_nodes, self.TOTAL_FEATURE_DIM), dtype=np.float32)
         
         for i in range(self.num_nodes):
             is_infected = 1.0 if i in infected_set else 0.0
@@ -326,12 +476,14 @@ class FeatureEngineerGFRR:
             else:
                 outward_ratio = 0.0
             
-            x_observed[i] = [
+            base_features = [
                 is_infected, norm_deg, norm_inf_count, log_deg,
                 norm_i_score, norm_kcore, norm_max_nb_kinf, mismatch,
                 kinf_rank_nb, is_peak, norm_bridge,
                 sg_closeness, sg_eccentricity, outward_ratio
             ]
+            rel_features = max_cc_relative_map.get(i, np.zeros(len(self.MAX_CC_RELATIVE_FEATURE_NAMES), dtype=np.float32))
+            x_observed[i] = np.concatenate([np.asarray(base_features, dtype=np.float32), rel_features], axis=0)
         
         # 应用特征消融
         if self.ablation_feature_idx is not None:
@@ -351,7 +503,7 @@ class FeatureEngineerGFRR:
             active_nodes: 当前输入图中的全局节点索引
 
         Returns:
-            x_observed: [M, 14] 局部观测特征
+            x_observed: [M, D] 局部观测特征
             k_inf_tensor: [M] 最大CC子图内的感染邻居数
         """
         active_nodes = np.asarray(active_nodes, dtype=np.int64)
@@ -375,12 +527,23 @@ class FeatureEngineerGFRR:
             )
         max_kinf = max(float(k_inf_local.max()) if len(k_inf_local) > 0 else 0.0, 1.0)
 
+        relative_feature_map = self._compute_max_cc_relative_feature_map(
+            max_cc_nodes=active_nodes,
+            infected_set=active_set,
+            k_inf_lookup={int(node_id): float(k_inf_local[local_idx]) for local_idx, node_id in enumerate(active_nodes)},
+            closeness_lookup=closeness,
+            eccentricity_lookup={
+                int(node_id): float(1.0 - (eccentricity.get(int(node_id), 0.0) / max_ecc)) if max_ecc > 0 else 0.0
+                for node_id in active_nodes
+            }
+        )
+
         sub_rank = {}
         sorted_idx = np.argsort(-k_inf_local)
         for rank, idx in enumerate(sorted_idx):
             sub_rank[int(active_nodes[idx])] = rank
 
-        x_observed = np.zeros((len(active_nodes), 14), dtype=np.float32)
+        x_observed = np.zeros((len(active_nodes), self.TOTAL_FEATURE_DIM), dtype=np.float32)
 
         for local_idx, node_id in enumerate(active_nodes):
             node_id = int(node_id)
@@ -431,12 +594,14 @@ class FeatureEngineerGFRR:
             else:
                 outward_ratio = 0.0
 
-            x_observed[local_idx] = [
+            base_features = [
                 1.0, norm_deg, norm_inf_count, log_deg,
                 norm_i_score, norm_kcore, norm_max_nb_kinf, mismatch,
                 kinf_rank_nb, is_peak, norm_bridge,
                 sg_closeness, sg_eccentricity, outward_ratio
             ]
+            rel_features = relative_feature_map.get(node_id, np.zeros(len(self.MAX_CC_RELATIVE_FEATURE_NAMES), dtype=np.float32))
+            x_observed[local_idx] = np.concatenate([np.asarray(base_features, dtype=np.float32), rel_features], axis=0)
 
         if self.ablation_feature_idx is not None:
             x_observed = self._apply_ablation(x_observed)
@@ -456,7 +621,7 @@ class FeatureEngineerGFRR:
             source_indices: 源点索引
         
         Returns:
-            x_source: [N, 14] 源点态特征
+            x_source: [N, D] 源点态特征
         """
         source_set = set(source_indices)
         
@@ -472,7 +637,7 @@ class FeatureEngineerGFRR:
             kcore_sub = {i: 0 for i in source_indices}
             max_kcore = 1
         
-        x_source = np.zeros((self.num_nodes, 14), dtype=np.float32)
+        x_source = np.zeros((self.num_nodes, self.TOTAL_FEATURE_DIM), dtype=np.float32)
         
         for i in range(self.num_nodes):
             is_source = 1.0 if i in source_set else 0.0
@@ -508,7 +673,7 @@ class FeatureEngineerGFRR:
             # 初始状态无传播方向
             outward_ratio = 0.0
             
-            x_source[i] = [
+            x_source[i, :self.BASE_FEATURE_DIM] = [
                 is_source, norm_deg, norm_inf_count, log_deg,
                 norm_i_score, norm_kcore, norm_max_nb_kinf, mismatch,
                 kinf_rank_nb, is_peak, norm_bridge,
@@ -542,9 +707,9 @@ class FeatureEngineerGFRR:
         if cache_name is not None:
             if use_max_cc_graph:
                 graph_mode = 'final' if final_only else 'allsnap'
-                suffix = f"_gfrr_multi_v3maxccgraph_{graph_mode}" if use_gfrr else f"_multi_v3maxccgraph_{graph_mode}"
+                suffix = f"_gfrr_multi_v4maxccgraph_{graph_mode}" if use_gfrr else f"_multi_v4maxccgraph_{graph_mode}"
             else:
-                suffix = '_gfrr_multi_v2cc' if use_gfrr else '_multi_v2cc'
+                suffix = '_gfrr_multi_v4ccfocus' if use_gfrr else '_multi_v4ccfocus'
             cache_path = os.path.join(cache_dir, f'feature_{cache_name}{suffix}.pt')
 
             if os.path.exists(cache_path):
@@ -629,6 +794,15 @@ class FeatureEngineerGFRR:
 
                     train_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
                     train_mask[infected_indices] = True
+                    max_cc_train_mask = train_mask & torch.BoolTensor(max_cc_mask_np)
+                    max_cc_has_source = bool(y_np_full[max_cc_mask_np].sum() > 0)
+
+                    if max_cc_has_source:
+                        loss_mask = max_cc_train_mask.clone()
+                        context_mask = train_mask & (~max_cc_train_mask)
+                    else:
+                        loss_mask = train_mask.clone()
+                        context_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
 
                     data = Data(
                         x=torch.FloatTensor(x_observed),
@@ -636,9 +810,13 @@ class FeatureEngineerGFRR:
                         degrees=full_node_degrees,
                         y=torch.FloatTensor(y_np_full),
                         train_mask=train_mask,
+                        loss_mask=loss_mask,
+                        context_mask=context_mask,
+                        max_cc_train_mask=max_cc_train_mask,
                         k_inf=k_inf_tensor,
                         max_cc_mask=torch.BoolTensor(max_cc_mask_np),
-                        max_cc_ratio=max_cc_ratio
+                        max_cc_ratio=max_cc_ratio,
+                        max_cc_has_source=max_cc_has_source
                     )
 
                     if use_gfrr:
@@ -660,9 +838,9 @@ class FeatureEngineerGFRR:
         if cache_name is not None:
             if use_max_cc_graph:
                 graph_mode = 'final' if final_only else 'allsnap'
-                suffix = f"_gfrr_multi_v3maxccgraph_{graph_mode}" if use_gfrr else f"_multi_v3maxccgraph_{graph_mode}"
+                suffix = f"_gfrr_multi_v4maxccgraph_{graph_mode}" if use_gfrr else f"_multi_v4maxccgraph_{graph_mode}"
             else:
-                suffix = '_gfrr_multi_v2cc' if use_gfrr else '_multi_v2cc'
+                suffix = '_gfrr_multi_v4ccfocus' if use_gfrr else '_multi_v4ccfocus'
             cache_path = os.path.join(cache_dir, f'feature_{cache_name}{suffix}.pt')
             os.makedirs(cache_dir, exist_ok=True)
             try:

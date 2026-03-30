@@ -162,7 +162,7 @@ class DualChannelInput(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [N, 14] 特征矩阵, 第0列是状态标志
+            x: [N, D] 特征矩阵, 第0列是状态标志
         
         Returns:
             h_fused: [N, state_dim + topo_dim] 融合特征
@@ -308,10 +308,10 @@ class MaxCCPoolInjector(nn.Module):
 # ==========================================
 class GFRREncoder(nn.Module):
     """
-    GFRR 编码器: 将 14 维输入特征映射到潜在空间
+    GFRR 编码器: 将输入特征映射到潜在空间
     
     架构:
-        Input [N, 14]
+        Input [N, D]
             ↓
         DualChannelInput (State + Topo)
             ↓
@@ -329,7 +329,7 @@ class GFRREncoder(nn.Module):
     """
     def __init__(
         self,
-        num_features: int = 14,
+        num_features: int = 22,
         hidden_dim: int = 32,
         num_blocks: int = 3,
         dropout: float = 0.3,
@@ -382,7 +382,7 @@ class GFRREncoder(nn.Module):
         前向传播
         
         Args:
-            x: 节点特征 [N, 14]
+            x: 节点特征 [N, D]
             edge_index: 边索引 [2, E]
             
         Returns:

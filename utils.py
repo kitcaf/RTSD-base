@@ -74,7 +74,7 @@ def compute_dynamic_pos_weight(dataset, scale_factor=1.0, min_weight=2.0, max_we
     total_infected = 0
     
     for data in dataset:
-        mask = data.train_mask
+        mask = data.loss_mask if hasattr(data, 'loss_mask') else data.train_mask
         y = data.y
         
         infected_labels = y[mask]
@@ -109,6 +109,36 @@ def compute_dynamic_pos_weight(dataset, scale_factor=1.0, min_weight=2.0, max_we
     }
     
     return pos_weight, stats
+
+
+def compute_ranking_focused_score(metrics, recall_k=5, weights=None):
+    """
+    计算排序导向的验证分数。
+
+    设计目标:
+        - 以 MAP / P@K_true / Recall@K 为主
+        - 保留少量 F1 约束, 防止分类阈值性能完全失控
+        - AED 越小越好, 因此转换为 aed_gain = 1 / (1 + AED)
+    """
+    if weights is None:
+        weights = {
+            'map': 0.35,
+            'p@k_true': 0.30,
+            'recall@k': 0.20,
+            'f1': 0.15,
+            'aed_gain': 0.10
+        }
+
+    recall_key = f'recall@{recall_k}'
+    aed_gain = 1.0 / (1.0 + max(metrics.get('aed', 0.0), 0.0))
+
+    return (
+        weights.get('map', 0.0) * metrics.get('map', 0.0) +
+        weights.get('p@k_true', 0.0) * metrics.get('p@k_true', 0.0) +
+        weights.get('recall@k', 0.0) * metrics.get(recall_key, 0.0) +
+        weights.get('f1', 0.0) * metrics.get('f1', 0.0) +
+        weights.get('aed_gain', 0.0) * aed_gain
+    )
 
 
 def apply_max_cc_hard_gate(logits, train_mask=None, max_cc_mask=None, gate_strength=12.0):

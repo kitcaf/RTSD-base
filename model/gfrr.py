@@ -41,7 +41,7 @@ class GFRRLite(nn.Module):
     """
     def __init__(
         self,
-        num_features: int = 14,
+        num_features: int = 22,
         hidden_dim: int = 32,
         encoder_blocks: int = 3,
         dropout: float = 0.3,
