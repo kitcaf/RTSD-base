@@ -54,6 +54,9 @@ from utils import compute_ranking_focused_score, log_print, setup_seed, setup_tr
 
 
 CHECKPOINT_DIR = "checkpoints_maxcc"
+
+
+
 LOG_SUFFIX = "gatv2_maxcc_log.txt"
 SAVE_TAG = "maxcc_role_rescore"
 EVAL_CANDIDATE = ALL_INFECTED
