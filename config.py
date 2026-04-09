@@ -19,7 +19,7 @@ BATCH_SIZE = 1
 WEIGHT_DECAY = 5e-4
 
 # ===== 通用特征和数据配置 =====
-NUM_FEATURES = 22  # 特征维度（14个基础特征 + 8个最大CC内部相对特征）
+NUM_FEATURES = 30  # 当前完整特征维度（14个基础特征 + 8个最大CC内部相对特征 + 8个角色特征）
 TRAIN_RATIO = 0.6
 VAL_RATIO = 0.2
 TEST_RATIO = 0.2
@@ -62,6 +62,10 @@ MODEL_SELECTION_WEIGHTS = {
     'f1': 0.15,
     'aed_gain': 0.10
 }
+
+# ===== 最大CC相对角色重打分配置 =====
+MAX_CC_ROLE_RESCORER_DROPOUT = 0.10
+MAX_CC_ROLE_RESIDUAL_SCALE = 1.0
 
 
 # ===== GFRR (GAT-Flow Residual Refiner) 模型架构配置 =====

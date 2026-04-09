@@ -43,7 +43,7 @@ class GFRRLoss(nn.Module):
             pos_weight=torch.tensor([pos_weight])
         )
     
-    def forward(self, logits, target, mask, k_inf=None, context_mask=None, feature_bank=None):
+    def forward(self, logits, target, mask, k_inf=None, context_mask=None, feature_bank=None, rank_mask=None):
         """
         计算总损失
         
@@ -54,6 +54,7 @@ class GFRRLoss(nn.Module):
             k_inf: 感染邻居数 [N] (用于 Ranking Loss)
             context_mask: 弱监督掩码 [N]
             feature_bank: 输入特征 [N, D]
+            rank_mask: Ranking 专用掩码 [N]，为空时默认等于 mask
         
         Returns:
             loss_dict: 包含各损失项的字典
@@ -64,6 +65,7 @@ class GFRRLoss(nn.Module):
         """
         device = logits.device
         mask = mask.bool()
+        rank_mask = mask if rank_mask is None else (rank_mask.bool() & mask)
         if context_mask is not None:
             context_mask = context_mask.bool()
         
@@ -90,7 +92,7 @@ class GFRRLoss(nn.Module):
                 logits=logits,
                 target=target,
                 k_inf=k_inf,
-                mask=mask,
+                mask=rank_mask,
                 feature_bank=feature_bank
             )
         else:

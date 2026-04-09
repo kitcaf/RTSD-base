@@ -52,6 +52,16 @@ class FeatureEngineerGFRR:
         [19] closeness_rank_minus_kinf_rank
         [20] kinf_vs_best_neighbor_ratio
         [21] distance_to_boundary_of_maxcc
+
+    最大CC角色强化特征:
+        [22] role_center_degree_residual
+        [23] role_center_kinf_residual
+        [24] role_degree_kinf_residual
+        [25] role_outward_center_synergy
+        [26] role_inner_center_synergy
+        [27] role_two_hop_outward_ratio
+        [28] role_core_bridge_synergy
+        [29] role_neighbor_suppression_balance
     """
     
     # 静态特征索引 (不依赖传播状态)
@@ -76,7 +86,36 @@ class FeatureEngineerGFRR:
         'distance_to_boundary_of_maxcc'
     ]
 
-    FEATURE_NAMES = BASE_FEATURE_NAMES + MAX_CC_RELATIVE_FEATURE_NAMES
+    FEATURE_CACHE_VERSION = "v5_role"
+
+    NON_ROLE_FEATURE_DIM = len(BASE_FEATURE_NAMES) + len(MAX_CC_RELATIVE_FEATURE_NAMES)
+
+    ROLE_FEATURE_NAMES = [
+        'role_center_degree_residual',
+        'role_center_kinf_residual',
+        'role_degree_kinf_residual',
+        'role_outward_center_synergy',
+        'role_inner_center_synergy',
+        'role_two_hop_outward_ratio',
+        'role_core_bridge_synergy',
+        'role_neighbor_suppression_balance'
+    ]
+
+    PRIMARY_ROLE_FEATURE_NAMES = [
+        'role_center_degree_residual',
+        'role_center_kinf_residual',
+        'role_outward_center_synergy',
+        'role_inner_center_synergy',
+        'role_neighbor_suppression_balance',
+    ]
+
+    EXPLORATORY_ROLE_FEATURE_NAMES = [
+        'role_degree_kinf_residual',
+        'role_two_hop_outward_ratio',
+        'role_core_bridge_synergy',
+    ]
+
+    FEATURE_NAMES = BASE_FEATURE_NAMES + MAX_CC_RELATIVE_FEATURE_NAMES + ROLE_FEATURE_NAMES
     FEATURE_INDEX = {name: idx for idx, name in enumerate(FEATURE_NAMES)}
     BASE_FEATURE_DIM = len(BASE_FEATURE_NAMES)
     TOTAL_FEATURE_DIM = len(FEATURE_NAMES)
@@ -202,6 +241,16 @@ class FeatureEngineerGFRR:
     def get_num_features(self):
         """返回当前特征维度"""
         return self.TOTAL_FEATURE_DIM - (1 if self.ablation_feature_idx is not None else 0)
+
+    @classmethod
+    def get_feature_indices(cls, feature_names):
+        """按特征名返回对应索引，缺失时显式报错，避免静默错位。"""
+        indices = []
+        for feature_name in feature_names:
+            if feature_name not in cls.FEATURE_INDEX:
+                raise KeyError(f"Unknown feature name: {feature_name}")
+            indices.append(cls.FEATURE_INDEX[feature_name])
+        return indices
 
     def _extract_max_cc_nodes(self, infected_indices):
         """
@@ -364,6 +413,102 @@ class FeatureEngineerGFRR:
 
         return feature_map
 
+    @staticmethod
+    def _clip_unit_interval(value):
+        return float(np.clip(value, 0.0, 1.0))
+
+    @staticmethod
+    def _clip_positive_tanh(value):
+        return float(np.tanh(max(float(value), 0.0)))
+
+    def _compute_two_hop_outward_ratio_map(self, active_nodes):
+        """
+        计算 2-hop 外向性:
+            在当前活跃子图内，统计节点 2-hop 邻居中度数比自己更小的占比。
+
+        这样可以补充 1-hop outward_ratio，帮助识别“向外扩散的中心启动者”。
+        """
+        active_nodes = np.asarray(active_nodes, dtype=np.int64)
+        if len(active_nodes) == 0:
+            return {}
+
+        active_set = set(int(node) for node in active_nodes.tolist())
+        two_hop_map = {}
+
+        for node in active_nodes:
+            node = int(node)
+            first_hop = [nb for nb in self.neighbors_list[node] if nb in active_set]
+            if not first_hop:
+                two_hop_map[node] = 0.0
+                continue
+
+            first_hop_set = set(first_hop)
+            two_hop_nodes = set()
+            for nb in first_hop:
+                for nb2 in self.neighbors_list[nb]:
+                    if nb2 == node or nb2 not in active_set or nb2 in first_hop_set:
+                        continue
+                    two_hop_nodes.add(nb2)
+
+            if not two_hop_nodes:
+                two_hop_map[node] = 0.0
+                continue
+
+            smaller_count = sum(1 for nb2 in two_hop_nodes if self.degrees[nb2] < self.degrees[node])
+            two_hop_map[node] = float(smaller_count / max(len(two_hop_nodes), 1))
+
+        return two_hop_map
+
+    def _build_role_feature_vector(
+        self,
+        *,
+        in_max_cc,
+        closeness_pct,
+        eccentricity_pct,
+        degree_pct,
+        kinf_pct,
+        outward_ratio,
+        two_hop_outward_ratio,
+        boundary_depth,
+        bridge_score,
+        kinf_neighbor_ratio,
+        is_local_peak
+    ):
+        """
+        基于 dataAnaly.md 中稳定成立的“源点角色画像”构造残差/交互特征。
+
+        画像总结:
+            1. 源点更居中
+            2. 源点更外向
+            3. 源点通常不是纯热点/纯 hub，而是“中心型启动者”
+        """
+        if not in_max_cc:
+            return np.zeros(len(self.ROLE_FEATURE_NAMES), dtype=np.float32)
+
+        closeness_pct = self._clip_unit_interval(closeness_pct)
+        eccentricity_pct = self._clip_unit_interval(eccentricity_pct)
+        degree_pct = self._clip_unit_interval(degree_pct)
+        kinf_pct = self._clip_unit_interval(kinf_pct)
+        outward_ratio = self._clip_unit_interval(outward_ratio)
+        two_hop_outward_ratio = self._clip_unit_interval(two_hop_outward_ratio)
+        boundary_depth = self._clip_unit_interval(boundary_depth)
+        bridge_score = self._clip_positive_tanh(bridge_score)
+        kinf_neighbor_ratio = self._clip_positive_tanh(kinf_neighbor_ratio)
+        is_local_peak = self._clip_unit_interval(is_local_peak)
+
+        center_role = 0.5 * (closeness_pct + eccentricity_pct)
+
+        return np.array([
+            center_role - degree_pct,
+            center_role - kinf_pct,
+            degree_pct - kinf_pct,
+            center_role * outward_ratio,
+            center_role * boundary_depth,
+            two_hop_outward_ratio,
+            boundary_depth * bridge_score,
+            kinf_neighbor_ratio * (1.0 - is_local_peak),
+        ], dtype=np.float32)
+
     def _build_local_edge_index(self, node_indices):
         """
         构建局部诱导子图的 edge_index，并重映射为局部编号。
@@ -414,6 +559,7 @@ class FeatureEngineerGFRR:
             closeness_lookup=closeness,
             eccentricity_lookup={int(node): float(1.0 - (eccentricity.get(int(node), 0.0) / max_ecc)) for node in max_cc_nodes}
         )
+        two_hop_outward_map = self._compute_two_hop_outward_ratio_map(infected_indices)
         
         # 子图内 k_inf 排名
         sub_rank = np.zeros(self.num_nodes)
@@ -475,6 +621,7 @@ class FeatureEngineerGFRR:
                 outward_ratio = smaller_count / len(infected_nbs)
             else:
                 outward_ratio = 0.0
+            two_hop_outward_ratio = two_hop_outward_map.get(i, 0.0)
             
             base_features = [
                 is_infected, norm_deg, norm_inf_count, log_deg,
@@ -482,8 +629,28 @@ class FeatureEngineerGFRR:
                 kinf_rank_nb, is_peak, norm_bridge,
                 sg_closeness, sg_eccentricity, outward_ratio
             ]
-            rel_features = max_cc_relative_map.get(i, np.zeros(len(self.MAX_CC_RELATIVE_FEATURE_NAMES), dtype=np.float32))
-            x_observed[i] = np.concatenate([np.asarray(base_features, dtype=np.float32), rel_features], axis=0)
+            in_max_cc = i in max_cc_relative_map
+            rel_features = max_cc_relative_map.get(
+                i,
+                np.zeros(len(self.MAX_CC_RELATIVE_FEATURE_NAMES), dtype=np.float32)
+            )
+            role_features = self._build_role_feature_vector(
+                in_max_cc=in_max_cc,
+                closeness_pct=rel_features[0],
+                eccentricity_pct=rel_features[1],
+                degree_pct=rel_features[2],
+                kinf_pct=rel_features[3],
+                outward_ratio=outward_ratio,
+                two_hop_outward_ratio=two_hop_outward_ratio,
+                boundary_depth=rel_features[7],
+                bridge_score=norm_bridge,
+                kinf_neighbor_ratio=rel_features[6],
+                is_local_peak=is_peak,
+            )
+            x_observed[i] = np.concatenate(
+                [np.asarray(base_features, dtype=np.float32), rel_features, role_features],
+                axis=0
+            )
         
         # 应用特征消融
         if self.ablation_feature_idx is not None:
@@ -537,6 +704,7 @@ class FeatureEngineerGFRR:
                 for node_id in active_nodes
             }
         )
+        two_hop_outward_map = self._compute_two_hop_outward_ratio_map(active_nodes)
 
         sub_rank = {}
         sorted_idx = np.argsort(-k_inf_local)
@@ -593,6 +761,7 @@ class FeatureEngineerGFRR:
                 outward_ratio = smaller_count / len(active_nbs)
             else:
                 outward_ratio = 0.0
+            two_hop_outward_ratio = two_hop_outward_map.get(node_id, 0.0)
 
             base_features = [
                 1.0, norm_deg, norm_inf_count, log_deg,
@@ -600,8 +769,27 @@ class FeatureEngineerGFRR:
                 kinf_rank_nb, is_peak, norm_bridge,
                 sg_closeness, sg_eccentricity, outward_ratio
             ]
-            rel_features = relative_feature_map.get(node_id, np.zeros(len(self.MAX_CC_RELATIVE_FEATURE_NAMES), dtype=np.float32))
-            x_observed[local_idx] = np.concatenate([np.asarray(base_features, dtype=np.float32), rel_features], axis=0)
+            rel_features = relative_feature_map.get(
+                node_id,
+                np.zeros(len(self.MAX_CC_RELATIVE_FEATURE_NAMES), dtype=np.float32)
+            )
+            role_features = self._build_role_feature_vector(
+                in_max_cc=True,
+                closeness_pct=rel_features[0],
+                eccentricity_pct=rel_features[1],
+                degree_pct=rel_features[2],
+                kinf_pct=rel_features[3],
+                outward_ratio=outward_ratio,
+                two_hop_outward_ratio=two_hop_outward_ratio,
+                boundary_depth=rel_features[7],
+                bridge_score=norm_bridge,
+                kinf_neighbor_ratio=rel_features[6],
+                is_local_peak=is_peak,
+            )
+            x_observed[local_idx] = np.concatenate(
+                [np.asarray(base_features, dtype=np.float32), rel_features, role_features],
+                axis=0
+            )
 
         if self.ablation_feature_idx is not None:
             x_observed = self._apply_ablation(x_observed)
@@ -707,9 +895,17 @@ class FeatureEngineerGFRR:
         if cache_name is not None:
             if use_max_cc_graph:
                 graph_mode = 'final' if final_only else 'allsnap'
-                suffix = f"_gfrr_multi_v4maxccgraph_{graph_mode}" if use_gfrr else f"_multi_v4maxccgraph_{graph_mode}"
+                suffix = (
+                    f"_gfrr_multi_{self.FEATURE_CACHE_VERSION}_maxccgraph_{graph_mode}"
+                    if use_gfrr else
+                    f"_multi_{self.FEATURE_CACHE_VERSION}_maxccgraph_{graph_mode}"
+                )
             else:
-                suffix = '_gfrr_multi_v4ccfocus' if use_gfrr else '_multi_v4ccfocus'
+                suffix = (
+                    f"_gfrr_multi_{self.FEATURE_CACHE_VERSION}_ccfocus"
+                    if use_gfrr else
+                    f"_multi_{self.FEATURE_CACHE_VERSION}_ccfocus"
+                )
             cache_path = os.path.join(cache_dir, f'feature_{cache_name}{suffix}.pt')
 
             if os.path.exists(cache_path):
@@ -717,10 +913,23 @@ class FeatureEngineerGFRR:
                 try:
                     cached_data = torch.load(cache_path)
                     has_multi = len(cached_data) > 0 and hasattr(cached_data[0], 'cascade_id')
-                    if has_multi:
+                    expected_feature_dim = self.get_num_features()
+                    cache_dim_matches = (
+                        has_multi and
+                        hasattr(cached_data[0], 'x') and
+                        cached_data[0].x is not None and
+                        cached_data[0].x.size(-1) == expected_feature_dim
+                    )
+                    if cache_dim_matches:
                         print(f"[*] 从缓存加载 {len(cached_data)} 个样本（多快照模式）")
                         return cached_data
-                    print(f"[!] 缓存格式不匹配（旧版单快照）, 重新计算...")
+                    if has_multi:
+                        current_dim = cached_data[0].x.size(-1) if hasattr(cached_data[0], 'x') and cached_data[0].x is not None else 'unknown'
+                        print(
+                            f"[!] 缓存特征维度不匹配（缓存={current_dim}, 期望={expected_feature_dim}）, 重新计算..."
+                        )
+                    else:
+                        print(f"[!] 缓存格式不匹配（旧版单快照）, 重新计算...")
                 except Exception as e:
                     print(f"[!] 缓存加载失败: {e}, 重新计算...")
 
@@ -838,9 +1047,17 @@ class FeatureEngineerGFRR:
         if cache_name is not None:
             if use_max_cc_graph:
                 graph_mode = 'final' if final_only else 'allsnap'
-                suffix = f"_gfrr_multi_v4maxccgraph_{graph_mode}" if use_gfrr else f"_multi_v4maxccgraph_{graph_mode}"
+                suffix = (
+                    f"_gfrr_multi_{self.FEATURE_CACHE_VERSION}_maxccgraph_{graph_mode}"
+                    if use_gfrr else
+                    f"_multi_{self.FEATURE_CACHE_VERSION}_maxccgraph_{graph_mode}"
+                )
             else:
-                suffix = '_gfrr_multi_v4ccfocus' if use_gfrr else '_multi_v4ccfocus'
+                suffix = (
+                    f"_gfrr_multi_{self.FEATURE_CACHE_VERSION}_ccfocus"
+                    if use_gfrr else
+                    f"_multi_{self.FEATURE_CACHE_VERSION}_ccfocus"
+                )
             cache_path = os.path.join(cache_dir, f'feature_{cache_name}{suffix}.pt')
             os.makedirs(cache_dir, exist_ok=True)
             try:
