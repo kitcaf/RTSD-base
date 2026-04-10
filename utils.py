@@ -141,6 +141,134 @@ def compute_ranking_focused_score(metrics, recall_k=5, weights=None):
     )
 
 
+def unwrap_model_outputs(model_output):
+    """
+    兼容单头/多头模型输出格式，统一返回 node logits 和 count logits。
+    """
+    if isinstance(model_output, dict):
+        node_logits = model_output.get('node_logits')
+        count_logits = model_output.get('count_logits')
+    elif isinstance(model_output, tuple):
+        node_logits = model_output[0]
+        count_logits = model_output[1] if len(model_output) > 1 else None
+    else:
+        node_logits = model_output
+        count_logits = None
+
+    if node_logits is None:
+        raise ValueError("model output does not contain node_logits")
+    return node_logits, count_logits
+
+
+def get_max_cc_source_count_targets(data, num_classes):
+    """
+    计算每个图样本在最大CC内部的真实源点个数标签。
+    """
+    if num_classes <= 1:
+        raise ValueError("num_classes must be > 1")
+    if not hasattr(data, 'y'):
+        raise ValueError("data.y is required to compute count targets")
+    if not hasattr(data, 'max_cc_mask'):
+        raise ValueError("data.max_cc_mask is required to compute count targets")
+
+    batch_index = getattr(data, 'batch', None)
+    if batch_index is None:
+        batch_index = torch.zeros_like(data.y, dtype=torch.long, device=data.y.device)
+
+    source_mask = data.y.bool()
+    max_cc_mask = data.max_cc_mask.bool()
+    num_graphs = int(batch_index.max().item()) + 1 if batch_index.numel() > 0 else 1
+
+    targets = torch.zeros(num_graphs, dtype=torch.long, device=data.y.device)
+    max_target = num_classes - 1
+    for graph_idx in range(num_graphs):
+        graph_mask = batch_index == graph_idx
+        graph_count = int((source_mask & max_cc_mask & graph_mask).sum().item())
+        targets[graph_idx] = min(graph_count, max_target)
+    return targets
+
+
+def build_count_guided_scores(
+    candidate_scores,
+    candidate_node_indices,
+    max_cc_mask_full,
+    predicted_count,
+    topk_boost,
+    non_topk_decay,
+    outside_maxcc_decay,
+    min_selection=1,
+):
+    """
+    根据预测的源点个数，对最大CC内部 top-k 节点进行增强，其余节点进行温和抑制。
+    """
+    scores = np.asarray(candidate_scores, dtype=np.float32).copy()
+    node_indices = np.asarray(candidate_node_indices, dtype=np.int64)
+    max_cc_mask_full = np.asarray(max_cc_mask_full, dtype=bool)
+
+    if scores.ndim != 1:
+        raise ValueError("candidate_scores must be a 1D array")
+    if node_indices.shape[0] != scores.shape[0]:
+        raise ValueError("candidate_node_indices must align with candidate_scores")
+
+    candidate_max_cc_mask = max_cc_mask_full[node_indices]
+    max_cc_positions = np.where(candidate_max_cc_mask)[0]
+    if max_cc_positions.size == 0:
+        return scores
+
+    clipped_count = int(np.clip(predicted_count, 0, max_cc_positions.size))
+    guided_count = max(min_selection, clipped_count)
+    guided_count = min(guided_count, max_cc_positions.size)
+
+    top_positions = max_cc_positions[np.argsort(-scores[max_cc_positions])[:guided_count]]
+    selected_mask = np.zeros_like(scores, dtype=bool)
+    selected_mask[top_positions] = True
+
+    non_selected_max_cc_mask = candidate_max_cc_mask & (~selected_mask)
+    outside_max_cc_mask = ~candidate_max_cc_mask
+
+    scores[selected_mask] = scores[selected_mask] + topk_boost * (1.0 - scores[selected_mask])
+    scores[non_selected_max_cc_mask] = scores[non_selected_max_cc_mask] * non_topk_decay
+    scores[outside_max_cc_mask] = scores[outside_max_cc_mask] * outside_maxcc_decay
+    return scores
+
+
+def compute_count_metrics(predicted_counts, true_counts):
+    """
+    汇总 count 任务指标。
+    """
+    if len(predicted_counts) != len(true_counts):
+        raise ValueError("predicted_counts and true_counts must have the same length")
+    if len(predicted_counts) == 0:
+        return {
+            'count_mae': 0.0,
+            'count_acc': 0.0,
+            'count_within_1': 0.0,
+        }
+
+    predicted_counts = np.asarray(predicted_counts, dtype=np.int64)
+    true_counts = np.asarray(true_counts, dtype=np.int64)
+    errors = np.abs(predicted_counts - true_counts)
+
+    return {
+        'count_mae': float(errors.mean()),
+        'count_acc': float((errors == 0).mean()),
+        'count_within_1': float((errors <= 1).mean()),
+    }
+
+
+def compute_multitask_selection_score(metrics, recall_k=5, ranking_weights=None, count_weight=0.0):
+    """
+    在排序导向分数基础上加入轻量 count 约束。
+    """
+    ranking_score = compute_ranking_focused_score(
+        metrics,
+        recall_k=recall_k,
+        weights=ranking_weights,
+    )
+    count_gain = 1.0 / (1.0 + max(metrics.get('count_mae', 0.0), 0.0))
+    return ranking_score + count_weight * count_gain
+
+
 def apply_max_cc_hard_gate(logits, train_mask=None, max_cc_mask=None, gate_strength=12.0):
     """
     对最大CC外感染节点执行输出层硬门控（logit下压）。
