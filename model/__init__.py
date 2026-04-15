@@ -1,17 +1,14 @@
-"""
-GFRR 模型包
-
-包含:
-    - encoder_gfrr: GFRR 编码器 (双通道输入 + GAT)
-    - gfrr: GFRR 主模型
-"""
-from .encoder_gfrr import GFRREncoder, DualChannelInput, GATv2Layer
-from .gfrr import GFRRLite, ClassificationHead
+from .data_types import ContextGraphSample, GraphStaticContext
+from .decoder import SetDecoder
+from .network import ContextRootModel
+from .sample_builder import ContextGraphDatasetBuilder
+from .trainer import Trainer
 
 __all__ = [
-    'GFRREncoder',
-    'DualChannelInput',
-    'GATv2Layer',
-    'GFRRLite',
-    'ClassificationHead'
+    "ContextGraphSample",
+    "ContextGraphDatasetBuilder",
+    "ContextRootModel",
+    "GraphStaticContext",
+    "SetDecoder",
+    "Trainer",
 ]

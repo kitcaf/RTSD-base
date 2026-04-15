@@ -1,325 +1,89 @@
-"""
-GFRR 训练入口
-使用 GFRRLite 模型 (Encoder + ClassHead)
+from __future__ import annotations
 
-使用方法:
-    python main.py
-"""
-import os
-import random
-import numpy as np
-import torch
-from torch_geometric.loader import DataLoader
-
-# 自定义模块
-from config import (
-    DEVICE, SEED, DATASETS, DATASET_NAMES, DATASET_IDX,
-    TRAIN_RATIO, VAL_RATIO, RECALL_K_VALUES, NUM_FEATURES,
-    LR, WEIGHT_DECAY, EPOCHS,
-    USE_DYNAMIC_POS_WEIGHT, DEFAULT_POS_WEIGHT,
-    USE_MAX_CC_GRAPH, MAX_CC_GRAPH_FINAL_ONLY, SKIP_SAMPLES_WITH_MISSING_SOURCES,
-    HARD_GATE_MAX_CC, LOGIT_GATE_VALUE,
-    USE_MAX_CC_POOL, MAX_CC_POOL_USE_MLP,
-    MAX_CC_POOL_ALPHA, MAX_CC_POOL_OUTSIDE_ALPHA,
-    MAX_CC_OUTSIDE_BCE_WEIGHT, MAX_CC_MAX_RANK_POSITIVES, MAX_CC_HARD_NEGATIVE_TOPK,
-    MODEL_SELECTION_RECALL_K, MODEL_SELECTION_WEIGHTS,
-    get_gfrr_arch_config, get_gfrr_loss_config
-)
+from config import DEVICE, RECALL_K_VALUES, SEED, build_experiment_config
 from data_loader import load_raw_data
-from feature_engineering_gfrr import FeatureEngineerGFRR
-from model.gfrr import GFRRLite
-from loss_gfrr import GFRRLoss
-from utils import (
-    setup_seed, 
-    compute_dynamic_pos_weight,
-    compute_ranking_focused_score,
-    find_optimal_threshold_gfrr,
-    evaluate_gfrr,
-    apply_max_cc_hard_gate,
-    setup_training_logger,
-    log_print
-)
 from metrics_utils import precompute_shortest_paths
+from model import ContextGraphDatasetBuilder, Trainer
+from utils import log_print, setup_seed, setup_training_logger, slice_if_needed, split_samples_by_cascade
 
 
-def train_epoch(model, loader, criterion, optimizer, device):
-    """
-    训练一个 epoch 
-    """
-    model.train()
-    
-    total_loss = 0
-    loss_components = {'cls': 0, 'bce': 0, 'bce_primary': 0, 'bce_context': 0, 'rank': 0}
-    num_batches = 0
-    
-    for data in loader:
-        data = data.to(device)
-        optimizer.zero_grad()
-        
-        logits = model(data)
-        if HARD_GATE_MAX_CC and hasattr(data, 'max_cc_mask'):
-            logits = apply_max_cc_hard_gate(
-                logits,
-                train_mask=data.train_mask,
-                max_cc_mask=data.max_cc_mask,
-                gate_strength=LOGIT_GATE_VALUE
-            )
-        
-        mask = data.loss_mask if hasattr(data, 'loss_mask') else data.train_mask
-        context_mask = data.context_mask if hasattr(data, 'context_mask') else None
-        if mask.sum() > 0:
-            loss_dict = criterion(
-                logits, data.y, mask,
-                k_inf=data.k_inf if hasattr(data, 'k_inf') else None,
-                context_mask=context_mask,
-                feature_bank=data.x
-            )
-            
-            loss = loss_dict['total']
-            loss.backward()
-            
-            # 梯度裁剪 (与完整版一致)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-            
-            total_loss += loss.item()
-            for key in loss_components:
-                if key in loss_dict:
-                    val = loss_dict[key]
-                    loss_components[key] += val.item() if torch.is_tensor(val) else val
-            num_batches += 1
-    
-    avg_loss = total_loss / max(num_batches, 1)
-    for key in loss_components:
-        loss_components[key] /= max(num_batches, 1)
-    
-    return avg_loss, loss_components
-
-
-def main():
-    # 初始化
+def main() -> None:
+    config = build_experiment_config()
     setup_seed(SEED)
-    
-    # 获取数据集名称并配置日志
-    data_name = DATASET_NAMES[DATASET_IDX]
-    log_file_name = f"{data_name}_log.txt"
-    logger = setup_training_logger(log_name=log_file_name)
-    
-    input_graph_desc = "最大CC诱导子图" if USE_MAX_CC_GRAPH else "全图（最大CC内主监督）"
-    cc_modules = []
-    if HARD_GATE_MAX_CC:
-        cc_modules.append("最大CC硬约束")
-    if USE_MAX_CC_POOL:
-        cc_modules.append("最大CC Pool")
-    cc_module_desc = " + ".join(cc_modules) if cc_modules else "无额外最大CC模块"
 
+    logger = setup_training_logger(log_name=f"{config.dataset_name}_context_gatv2.log")
     log_print(logger, "=" * 60)
-    log_print(logger, f"[*] 说明: 使用 GFRRLite (Encoder + ClassHead | 输入图={input_graph_desc} | {cc_module_desc})")
-    log_print(logger, "=" * 60)
+    log_print(logger, "[*] 实验: ContextGraph + GATv2 + 可学习 Set Decoder")
+    log_print(logger, f"[*] 数据集: {config.dataset_name}")
     log_print(logger, f"[*] 设备: {DEVICE}")
-    
-    # 加载数据
-    adj, influ = load_raw_data(DATASETS[DATASET_IDX])
-    log_print(logger, f"[*] 数据集: {data_name}")
-    log_print(logger, f"    节点数: {adj.shape[0]}, 级联数: {len(influ)}")
-    
-    # 获取配置
-    arch_config = get_gfrr_arch_config()
-    loss_config = get_gfrr_loss_config()
-    
-    # 特征工程
-    engineer = FeatureEngineerGFRR(adj)
-    dataset = engineer.generate_dataset(
-        influ,
-        cache_name=data_name,
-        use_gfrr=False,
-        use_max_cc_graph=USE_MAX_CC_GRAPH,
-        final_only=MAX_CC_GRAPH_FINAL_ONLY,
-        require_source_in_graph=SKIP_SAMPLES_WITH_MISSING_SOURCES
+    log_print(logger, f"[*] Recall@K: {RECALL_K_VALUES}")
+    log_print(logger, f"[*] Eval Scope: {config.data.eval_scope}")
+    log_print(logger, f"[*] Warmup Epochs: {config.training.warmup_epochs}")
+    log_print(logger, "=" * 60)
+
+    adjacency_matrix, influence_matrices = load_raw_data(config.dataset_file)
+    dataset_builder = ContextGraphDatasetBuilder(
+        adjacency_matrix=adjacency_matrix,
+        include_ring_hops=config.data.include_ring_hops,
+        max_boundary_ring_size=config.data.max_boundary_ring_size,
+        allow_zero_source_in_maxcc=config.training.allow_zero_source_in_maxcc,
+        seed=SEED,
     )
-    
-    # 预计算最短路径 (与完整版完全一致)
-    log_print(logger, "[*] 预计算最短路径矩阵...")
-    dist_matrix = precompute_shortest_paths(adj)
-    
-    # 数据划分 ── 按 cascade_id 分组，保证同一级联的不同快照落在同一分区
-    # · 当 MAX_CC_GRAPH_FINAL_ONLY=True 时，Train/Val/Test 都只包含最终快照
-    # · 否则 Train 保留训练分区全部快照，Val/Test 仍只保留最终快照
-    all_cascade_ids = sorted(set(d.cascade_id for d in dataset))
-    random.shuffle(all_cascade_ids)
-    n_cas = len(all_cascade_ids)
+    samples, stats = dataset_builder.build_dataset(influence_matrices)
+    if not samples:
+        raise RuntimeError("No valid samples were built. Please check dataset construction settings.")
 
-    train_cas_ids = set(all_cascade_ids[:int(n_cas * TRAIN_RATIO)])
-    val_cas_ids   = set(all_cascade_ids[int(n_cas * TRAIN_RATIO):int(n_cas * (TRAIN_RATIO + VAL_RATIO))])
-    test_cas_ids  = set(all_cascade_ids[int(n_cas * (TRAIN_RATIO + VAL_RATIO)):])
-
-    train_set = [d for d in dataset if d.cascade_id in train_cas_ids]
-    val_set   = [d for d in dataset if d.cascade_id in val_cas_ids   and d.is_final]
-    test_set  = [d for d in dataset if d.cascade_id in test_cas_ids  and d.is_final]
-
-    train_snapshot_desc = "仅最终快照" if MAX_CC_GRAPH_FINAL_ONLY else "含所有快照"
-    log_print(logger, f"[*] 数据划分: Train={len(train_set)} ({train_snapshot_desc}), Val={len(val_set)} (仅最终快照), Test={len(test_set)} (仅最终快照)")
-    log_print(logger, f"    梯度级联数: Train={len(train_cas_ids)}, Val={len(val_cas_ids)}, Test={len(test_cas_ids)}")
-    if train_set and not USE_MAX_CC_GRAPH:
-        avg_max_cc_ratio = float(np.mean([float(getattr(d, 'max_cc_ratio', 0.0)) for d in train_set]))
-        max_cc_source_coverage = float(np.mean([
-            1.0 if getattr(d, 'max_cc_has_source', True) else 0.0 for d in train_set
-        ]))
-        log_print(logger, f"    Train 平均 max_cc_ratio={avg_max_cc_ratio:.4f}, maxCC含源点比例={max_cc_source_coverage:.4f}")
-
-    
-    train_loader = DataLoader(train_set, batch_size=1, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=1)
-    test_loader = DataLoader(test_set, batch_size=1)
-    
-    # 确定 pos_weight (与完整版完全一致)
-    if USE_DYNAMIC_POS_WEIGHT:
-        pos_weight, _ = compute_dynamic_pos_weight(train_set)
-        log_print(logger, f"[*] 动态 pos_weight: {pos_weight:.2f}")
-    else:
-        pos_weight = loss_config.get('pos_weight', DEFAULT_POS_WEIGHT)
-        log_print(logger, f"[*] 静态 pos_weight: {pos_weight:.2f}")
-    
-    model = GFRRLite(
-        num_features=train_set[0].x.size(-1) if train_set else NUM_FEATURES,
-        hidden_dim=arch_config.get('hidden_dim', 32),
-        encoder_blocks=arch_config.get('encoder_blocks', 3),
-        dropout=arch_config.get('dropout', 0.3),
-        use_max_cc_pool=USE_MAX_CC_POOL,
-        max_cc_pool_use_mlp=MAX_CC_POOL_USE_MLP,
-        max_cc_pool_alpha=MAX_CC_POOL_ALPHA,
-        max_cc_pool_outside_alpha=MAX_CC_POOL_OUTSIDE_ALPHA
-    ).to(DEVICE)
-    
-    # 打印模型参数
-    param_info = model.get_num_params()
-    log_print(logger, f"[*] 模型参数:")
-    log_print(logger, f"    Encoder: {param_info['encoder']:,}")
-    log_print(logger, f"    ClassHead: {param_info['class_head']:,}")
-    log_print(logger, f"    Total: {param_info['total']:,}")
-    
-    criterion = GFRRLoss(
-        pos_weight=pos_weight,
-        lambda_rank=loss_config.get('lambda_rank', 0.1),
-        margin=loss_config.get('margin', 0.15),
-        outside_bce_weight=MAX_CC_OUTSIDE_BCE_WEIGHT,
-        max_rank_positives=MAX_CC_MAX_RANK_POSITIVES,
-        hard_negative_topk=MAX_CC_HARD_NEGATIVE_TOPK
-    ).to(DEVICE)
-    
-    # 优化器 (与完整版完全一致)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=LR,
-        weight_decay=WEIGHT_DECAY
+    log_print(
+        logger,
+        f"[*] 样本构建完成: kept={stats.kept_samples}, skipped_empty={stats.skipped_empty}, "
+        f"skipped_no_source_in_maxcc={stats.skipped_without_source_in_maxcc}",
     )
-    
-    # 训练配置
-    epochs = EPOCHS
-    
-    log_print(logger, f"\n{'='*60}")
-    log_print(logger, f"      Epochs: {epochs}")
-    log_print(logger, f"      LR: {LR}")
-    log_print(logger, f"      Weight Decay: {WEIGHT_DECAY}")
-    log_print(logger, f"      Lambda Rank: {loss_config.get('lambda_rank', 0.1)}")
-    log_print(logger, f"      pos_weight: {pos_weight}")
-    log_print(logger, f"      hidden_dim: {arch_config.get('hidden_dim', 32)}")
-    log_print(logger, f"      encoder_blocks: {arch_config.get('encoder_blocks', 3)}")
-    log_print(logger, f"      Max-CC Pool: {USE_MAX_CC_POOL} (mlp={MAX_CC_POOL_USE_MLP}, alpha={MAX_CC_POOL_ALPHA}, outside_alpha={MAX_CC_POOL_OUTSIDE_ALPHA})")
-    log_print(logger, f"      Max-CC硬门控: {HARD_GATE_MAX_CC} (gate={LOGIT_GATE_VALUE})")
-    log_print(logger, f"      Max-CC弱监督权重: {MAX_CC_OUTSIDE_BCE_WEIGHT}")
-    log_print(logger, f"      Max-CC hardest negatives: top-{MAX_CC_HARD_NEGATIVE_TOPK}, hard positives: {MAX_CC_MAX_RANK_POSITIVES}")
-    log_print(logger, f"      模型选择: RankingScore (MAP/P@K_true/Recall@{MODEL_SELECTION_RECALL_K}/F1/AED)")
-    log_print(logger, f"      数据划分: cascade_id 分组 (Train={train_snapshot_desc}, Val/Test=仅最终快照)")
-    log_print(logger, f"      输入图模式: {input_graph_desc} (final_only={MAX_CC_GRAPH_FINAL_ONLY}, skip_missing_sources={SKIP_SAMPLES_WITH_MISSING_SOURCES})")
-    log_print(logger, f"{'='*60}\n")
-    
-    # 训练循环
-    best_val_score = float('-inf')
-    best_val_f1 = 0
-    best_threshold = 0.5
-    best_epoch = 0
-    save_tag = 'maxccgraph' if USE_MAX_CC_GRAPH else 'ccfocus_fullgraph'
-    save_path = f'checkpoints_gfrr/gfrr_lite_{data_name}_{save_tag}_best.pt'
-    os.makedirs('checkpoints_gfrr', exist_ok=True)
-    
-    for epoch in range(epochs):
-        avg_loss, loss_comp = train_epoch(model, train_loader, criterion, optimizer, DEVICE)
-        
-        best_th, _ = find_optimal_threshold_gfrr(
-            model,
-            val_loader,
-            DEVICE,
-            dist_matrix=dist_matrix,
-            hard_gate_max_cc=HARD_GATE_MAX_CC,
-            gate_strength=LOGIT_GATE_VALUE
-        )
-        val_metrics = evaluate_gfrr(
-            model, val_loader, DEVICE,
-            threshold=best_th,
-            recall_k_values=RECALL_K_VALUES,
-            dist_matrix=dist_matrix,
-            hard_gate_max_cc=HARD_GATE_MAX_CC,
-            gate_strength=LOGIT_GATE_VALUE
-        )
-        val_score = compute_ranking_focused_score(
-            val_metrics,
-            recall_k=MODEL_SELECTION_RECALL_K,
-            weights=MODEL_SELECTION_WEIGHTS
-        )
-        
-        # 保存最佳模型
-        if val_score > best_val_score:
-            best_val_score = val_score
-            best_val_f1 = val_metrics['f1']
-            best_threshold = best_th
-            best_epoch = epoch + 1
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'threshold': best_threshold,
-                'epoch': best_epoch,
-                'val_f1': best_val_f1,
-                'val_score': best_val_score
-            }, save_path)
-        
-        # 打印进度
-        recall_str = " | ".join([f"R@{k}: {val_metrics[f'recall@{k}']:.3f}" for k in RECALL_K_VALUES])
-        log_print(logger, f"Epoch {epoch+1:03d} | Loss: {avg_loss:.4f} "
-              f"(BCE:{loss_comp['bce']:.3f}, BCE_in:{loss_comp['bce_primary']:.3f}, "
-              f"BCE_out:{loss_comp['bce_context']:.3f}, Rank:{loss_comp['rank']:.3f}) | "
-              f"Val Score: {val_score:.4f} | Val F1: {val_metrics['f1']:.4f} | "
-              f"MAP: {val_metrics['map']:.4f} | P@K: {val_metrics['p@k_true']:.4f} | {recall_str}")
-    
-    log_print(logger, f"[*] 最佳 Val Score: {best_val_score:.4f} | F1: {best_val_f1:.4f} @ Epoch {best_epoch}")
-    
-    # 加载最佳模型并测试
-    checkpoint = torch.load(save_path)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    test_metrics = evaluate_gfrr(
-        model, test_loader, DEVICE,
-        threshold=best_threshold,
-        recall_k_values=RECALL_K_VALUES,
-        dist_matrix=dist_matrix,
-        hard_gate_max_cc=HARD_GATE_MAX_CC,
-        gate_strength=LOGIT_GATE_VALUE
+
+    train_samples, val_samples, test_samples = split_samples_by_cascade(
+        samples=samples,
+        train_ratio=config.training.train_ratio,
+        val_ratio=config.training.val_ratio,
+        seed=SEED,
     )
-    
-    log_print(logger, f"\n{'='*60}")
-    log_print(logger, f"[*] 测试结果:")
-    log_print(logger, f"[*] 阈值: {best_threshold}")
-    log_print(logger, f"    Val Score : {checkpoint.get('val_score', best_val_score):.4f}")
-    log_print(logger, f"    AUC       : {test_metrics['auc']:.4f}")
-    log_print(logger, f"    Precision : {test_metrics['precision']:.4f}")
-    log_print(logger, f"    Recall    : {test_metrics['recall']:.4f}")
-    log_print(logger, f"    F1-Score  : {test_metrics['f1']:.4f}")
-    for k in RECALL_K_VALUES:
-        log_print(logger, f"    Recall@{k:<2} : {test_metrics[f'recall@{k}']:.4f}")
-    log_print(logger, f"    MAP       : {test_metrics['map']:.4f}")
-    log_print(logger, f"    P@K_true  : {test_metrics['p@k_true']:.4f}")
-    log_print(logger, f"    AED       : {test_metrics['aed']:.4f}")
-    log_print(logger, f"{'='*60}")
+    train_samples = slice_if_needed(train_samples, config.data.quick_train_samples)
+    val_samples = slice_if_needed(val_samples, config.data.quick_val_samples)
+    test_samples = slice_if_needed(test_samples, config.data.quick_test_samples)
+    if not train_samples or not val_samples or not test_samples:
+        raise RuntimeError("Train/val/test split produced an empty subset.")
+
+    log_print(
+        logger,
+        f"[*] 数据划分: train={len(train_samples)}, val={len(val_samples)}, test={len(test_samples)}",
+    )
+
+    log_print(logger, "[*] 预计算 AED 懒加载最短路查询器...")
+    dist_matrix = precompute_shortest_paths(adjacency_matrix)
+
+    trainer = Trainer(config=config, device=DEVICE, dist_matrix=dist_matrix, logger=logger)
+    model = trainer.build_model(train_samples)
+    training_artifacts = trainer.train(model=model, train_samples=train_samples, val_samples=val_samples)
+    test_metrics = trainer.evaluate(
+        model=training_artifacts.model,
+        samples=test_samples,
+    )
+
+    log_print(logger, "\n" + "=" * 60)
+    log_print(logger, f"[*] 最佳 Epoch: {training_artifacts.best_epoch}")
+    log_print(logger, f"[*] 最佳验证分数: {training_artifacts.best_val_score:.4f}")
+    log_print(logger, f"[*] 测试 AUC       : {test_metrics['auc']:.4f}")
+    log_print(logger, f"[*] 测试 Precision : {test_metrics['precision']:.4f}")
+    log_print(logger, f"[*] 测试 Recall    : {test_metrics['recall']:.4f}")
+    log_print(logger, f"[*] 测试 F1        : {test_metrics['f1']:.4f}")
+    for recall_k in RECALL_K_VALUES:
+        log_print(logger, f"[*] 测试 Recall@{recall_k:<2} : {test_metrics[f'recall@{recall_k}']:.4f}")
+    log_print(logger, f"[*] 测试 MAP       : {test_metrics['map']:.4f}")
+    log_print(logger, f"[*] 测试 P@K_true  : {test_metrics['p@k_true']:.4f}")
+    log_print(logger, f"[*] 测试 AED       : {test_metrics['aed']:.4f}")
+    log_print(logger, f"[*] Count MAE      : {test_metrics['count_mae']:.4f}")
+    log_print(logger, f"[*] Count Acc      : {test_metrics['count_acc']:.4f}")
+    log_print(logger, f"[*] Count Within 1 : {test_metrics['count_within_1']:.4f}")
+    log_print(logger, "=" * 60)
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,69 @@
+============================================================================
+最大 CC 纯输入诊断报告 - twitter (all)
+============================================================================
+
+[最大 CC 总体概况]
+  - cascade_count: 2392
+  - infected_size_mean: 50.756689
+  - source_count_mean: 7.847826
+  - max_cc_size_mean: 32.574833
+  - max_cc_ratio_mean: 0.643449
+  - source_in_maxcc_mean: 6.492475
+  - source_density_in_maxcc_mean: 0.345375
+  - all_sources_in_maxcc_ratio: 0.736622
+  - has_source_in_maxcc_ratio: 0.907609
+  - source_spread_mean: 1.689381
+  - mean_source_pair_distance: 1.166601
+  - direct_neighbor_ratio_mean: 0.27356
+  - within_two_hop_ratio_mean: 0.474603
+  - source_boundary_depth_mean: 0.006244
+
+[源点形态分布]
+  - 2-hop 邻近
+    * 簇: ratio=0.4143, maxcc=38.99, src=7.35, density=0.5048, pair_dist=1.41, boundary_depth=0.0058
+    * singleton: ratio=0.4110, maxcc=8.29, src=1.71, density=0.1867, pair_dist=0.00, boundary_depth=0.0051
+    * 多区块: ratio=0.0924, maxcc=92.94, src=21.87, density=0.2123, pair_dist=4.09, boundary_depth=0.0119
+    * 链: ratio=0.0824, maxcc=53.76, src=25.25, density=0.4841, pair_dist=2.48, boundary_depth=0.0079
+    * 松散团: ratio=0.0000, maxcc=0.00, src=0.00, density=0.0000, pair_dist=0.00, boundary_depth=0.0000
+  - 1-hop 邻近
+    * 簇: ratio=0.2826, maxcc=9.92, src=3.82, density=0.5582, pair_dist=1.20, boundary_depth=0.0065
+    * singleton: ratio=0.4110, maxcc=8.29, src=1.71, density=0.1867, pair_dist=0.00, boundary_depth=0.0051
+    * 多区块: ratio=0.2404, maxcc=68.73, src=18.21, density=0.3017, pair_dist=2.89, boundary_depth=0.0087
+    * 链: ratio=0.0355, maxcc=255.92, src=37.79, density=0.5996, pair_dist=2.18, boundary_depth=0.0044
+    * 松散团: ratio=0.0305, maxcc=24.55, src=11.30, density=0.5589, pair_dist=1.73, boundary_depth=0.0027
+
+[纯结构指标排序 Top 12]
+  - 最大CC内外向比 (outward_ratio_in_maxcc): AP=0.5491, AUC=0.5641, src_pct=0.5534, top1=0.4533, topk=0.4058, single=0.3508
+  - 全局度 (global_degree): AP=0.5470, AUC=0.5671, src_pct=0.5556, top1=0.4545, topk=0.4054, single=0.3469
+  - 最大CC内部感染度 (infected_degree_in_maxcc): AP=0.5333, AUC=0.5684, src_pct=0.5524, top1=0.4711, topk=0.4117, single=0.3460
+  - 最大CC内harmonic中心性 (harmonic_in_maxcc): AP=0.5332, AUC=0.5703, src_pct=0.5535, top1=0.4697, topk=0.4137, single=0.3448
+  - 最大CC内接近中心性 (closeness_in_maxcc): AP=0.5327, AUC=0.5681, src_pct=0.5518, top1=0.4691, topk=0.4124, single=0.3442
+  - 最大CC内平均距离 (avg_distance_in_maxcc): AP=0.5327, AUC=0.5681, src_pct=0.5518, top1=0.4691, topk=0.4124, single=0.3442
+  - 相对最强邻居比 (kinf_vs_best_neighbor_ratio): AP=0.5310, AUC=0.5641, src_pct=0.5503, top1=0.4674, topk=0.4075, single=0.3435
+  - 更强邻居占比 (stronger_neighbor_ratio): AP=0.5308, AUC=0.5647, src_pct=0.5496, top1=0.4679, topk=0.4106, single=0.3459
+  - 最大CC内偏心率反分数 (eccentricity_score_in_maxcc): AP=0.5232, AUC=0.5528, src_pct=0.5406, top1=0.4435, topk=0.4032, single=0.3324
+  - 内部连接占比 (internal_degree_ratio): AP=0.4689, AUC=0.4602, src_pct=0.4652, top1=0.3117, topk=0.3220, single=0.2122
+  - 最大CC内k-core (kcore_in_maxcc): AP=0.4299, AUC=0.5284, src_pct=0.5209, top1=0.3605, topk=0.3587, single=0.2478
+  - 最大CC边界深度 (boundary_depth_in_maxcc): AP=0.3500, AUC=0.4990, src_pct=0.4985, top1=0.3399, topk=0.3413, single=0.2390
+
+[难度分层]
+  - max_cc_size
+    * <=10: n=1523, infected=17.01, maxcc=5.08, src=2.64, src_in_maxcc=1.85, density=0.3911, all_in_maxcc=0.7551, boundary_depth=0.0048, pair_dist=0.61
+    * 11-20: n=324, infected=36.50, maxcc=14.71, src=6.55, src_in_maxcc=4.72, density=0.3176, all_in_maxcc=0.7099, boundary_depth=0.0028, pair_dist=1.46
+    * 21-50: n=256, infected=59.47, maxcc=33.18, src=10.81, src_in_maxcc=8.16, density=0.2555, all_in_maxcc=0.7188, boundary_depth=0.0040, pair_dist=2.07
+    * 51-100: n=146, infected=111.45, maxcc=74.10, src=18.03, src_in_maxcc=15.25, density=0.2120, all_in_maxcc=0.7534, boundary_depth=0.0277, pair_dist=2.79
+    * >100: n=143, infected=364.94, maxcc=322.42, src=50.57, src_in_maxcc=48.08, density=0.2179, all_in_maxcc=0.6154, boundary_depth=0.0119, pair_dist=3.14
+  - source_count
+    * 1: n=744, infected=17.28, maxcc=8.07, src=1.00, src_in_maxcc=0.87, density=0.2144, all_in_maxcc=0.8683, boundary_depth=0.0054, pair_dist=0.00
+    * 2-3: n=718, infected=25.18, maxcc=11.10, src=2.35, src_in_maxcc=1.90, density=0.3771, all_in_maxcc=0.7604, boundary_depth=0.0019, pair_dist=1.14
+    * 4-6: n=366, infected=41.61, maxcc=22.36, src=4.70, src_in_maxcc=3.86, density=0.4169, all_in_maxcc=0.7104, boundary_depth=0.0074, pair_dist=1.59
+    * 7+: n=564, infected=133.40, maxcc=98.86, src=25.92, src_in_maxcc=21.47, density=0.4313, all_in_maxcc=0.5496, boundary_depth=0.0122, pair_dist=2.47
+  - source_density
+    * <=0.10: n=482, infected=114.21, maxcc=75.21, src=5.34, src_in_maxcc=3.82, density=0.0314, all_in_maxcc=0.4253, boundary_depth=0.0059, pair_dist=0.91
+    * 0.10-0.20: n=467, infected=52.97, maxcc=35.77, src=5.96, src_in_maxcc=5.02, density=0.1587, all_in_maxcc=0.8073, boundary_depth=0.0049, pair_dist=1.00
+    * 0.20-0.35: n=503, infected=32.55, maxcc=21.19, src=6.76, src_in_maxcc=5.86, density=0.2856, all_in_maxcc=0.8529, boundary_depth=0.0075, pair_dist=0.99
+    * >0.35: n=940, infected=26.86, maxcc=15.21, src=10.65, src_in_maxcc=8.93, density=0.6311, all_in_maxcc=0.7989, boundary_depth=0.0064, pair_dist=1.48
+  - source_spread
+    * 1: n=1905, infected=39.03, maxcc=31.02, src=5.57, src_in_maxcc=5.47, density=0.3462, all_in_maxcc=0.9249, boundary_depth=0.0059, pair_dist=1.00
+    * 2: n=224, infected=66.99, maxcc=33.48, src=9.21, src_in_maxcc=7.32, density=0.3398, all_in_maxcc=0.0000, boundary_depth=0.0011, pair_dist=1.33
+    * 3+: n=263, infected=121.89, maxcc=43.04, src=23.15, src_in_maxcc=13.20, density=0.3441, all_in_maxcc=0.0000, boundary_depth=0.0131, pair_dist=2.21

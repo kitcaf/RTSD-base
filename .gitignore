@@ -21,3 +21,4 @@
 /checkpoints_gfrr/*pt
 /*.SG
 *.pt
+*.csv
